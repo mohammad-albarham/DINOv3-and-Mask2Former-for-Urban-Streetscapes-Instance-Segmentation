@@ -71,3 +71,13 @@ g_cities = dataset[dataset['city'].str.lower().str.startswith('g')]
 print("\nCities that start with 'g':")
 print(g_cities['city'].unique())
 # %%
+
+
+# Extracting the cities in Sweden 
+
+swedish_cities = dataset[dataset['country']  == "Sweden"]
+
+print("\nCities in Sweden")
+
+swedish_cities
+# %%
