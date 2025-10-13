@@ -81,3 +81,28 @@ print("\nCities in Sweden")
 
 swedish_cities
 # %%
+
+from datasets import load_dataset
+
+# Load the Global Streetscapes dataset as a streaming dataset
+dataset = load_dataset("NUS-UAL/global-streetscapes", split="train", streaming=True)
+
+# Get the first sample using an iterator
+sample = next(iter(dataset))
+print(sample)  # Inspect available fields
+
+# If a segmentation mask field exists (e.g., 'segmentation_path'), update this variable name accordingly
+from PIL import Image
+import requests
+from io import BytesIO
+
+segmentation_url = sample.get('segmentation_mask_url')  # Replace with correct field name if different
+if segmentation_url:
+    segmentation_mask = Image.open(BytesIO(requests.get(segmentation_url).content))
+    segmentation_mask.show()
+else:
+    print("Segmentation mask not found in this sample. Available fields are:", sample.keys())
+
+
+
+# %%

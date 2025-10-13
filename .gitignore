@@ -10,3 +10,20 @@ wheels/
 .venv
 .DS_Store
 *.csv 
+
+
+# Folders 
+
+mapillary_dataset/*
+global-streetscapes/*
+
+
+# logs 
+
+*.log
+
+# untracked files
+
+*.csv
+settings.json
+*lock
