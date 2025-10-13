@@ -15,15 +15,17 @@ wheels/
 # Folders 
 
 mapillary_dataset/*
+mapillary_dataset copy/*
 global-streetscapes/*
-
+wandb/*
 
 # logs 
 
 *.log
+*.wandb
 
 # untracked files
-
+*.png
 *.csv
 settings.json
 *lock
