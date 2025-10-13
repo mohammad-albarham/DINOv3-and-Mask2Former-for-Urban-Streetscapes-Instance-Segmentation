@@ -12,9 +12,11 @@ from rich import print as rprint
 
 DEBUG = False  # Set to False to suppress rich printing
 
+
 def rich_debug(*args, **kwargs):
     if DEBUG:
         rprint(*args, **kwargs)
+
 
 # %%
 # Use a smaller DINOv3 model for faster demos
@@ -23,7 +25,6 @@ model_name = "facebook/dino-vits16"
 processor = AutoImageProcessor.from_pretrained(model_name, use_fast=True)
 model = AutoModel.from_pretrained(model_name)
 model.eval()  # Set the model to evaluation mode
-
 
 
 def extract_pooled_features(images):
@@ -66,7 +67,8 @@ images = [load_image(url) for url in image_urls]
 
 image = images[0]
 
-#%%
+
+# %%
 # Improved segmentation head: MLP + upsampling for patch->pixel mapping
 class SegmentationHead(nn.Module):
     def __init__(self, input_dim=384, num_classes=10, hidden_dim=256):
@@ -85,7 +87,6 @@ class SegmentationHead(nn.Module):
 
 # Forward function and visualization
 def patch_segmentation_demo(image, patch_features, seg_head, patch_size=16):
-
     rich_debug(f"image: {type(image)}")
     # Removed CLS token:-> [196, dim] for 224x224 image, 16x16 patches
     patch_tokens = patch_features  # [196, 384]
@@ -130,7 +131,7 @@ def patch_segmentation_demo(image, patch_features, seg_head, patch_size=16):
 seg_head = SegmentationHead(input_dim=384, num_classes=10)
 
 
-image = image.convert("RGB")      # Ensure it's 3 channels
+image = image.convert("RGB")  # Ensure it's 3 channels
 image_np = np.array(image)
 
 # Get patch features for the cat image
