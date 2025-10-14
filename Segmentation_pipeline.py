@@ -43,28 +43,30 @@ image_file_lists = {}
 label_file_lists = {}
 
 # Control how many images to use from each split
-# I can use None for full dataset 
-MAX_TRAIN = 1000 # None if you want full dataset
+# I can use None for full dataset
+MAX_TRAIN = 1000  # None if you want full dataset
 MAX_VAL = 200
 MAX_TEST = 100
 
 for split in splits:
     images_dir = os.path.join(dataset_root, split, "images")
     labels_dir = os.path.join(dataset_root, split, "v2.0", "labels")
-    
+
     # Slice the lists to control size
     image_file_lists[split] = sorted(glob.glob(os.path.join(images_dir, "*.jpg")))
-    
-    if split == 'training':
+
+    if split == "training":
         image_file_lists[split] = image_file_lists[split][:MAX_TRAIN]
-    elif split == 'validation':
+    elif split == "validation":
         image_file_lists[split] = image_file_lists[split][:MAX_VAL]
-    elif split == 'testing':
+    elif split == "testing":
         image_file_lists[split] = image_file_lists[split][:MAX_TEST]
-    
+
     # Match label files to images
     if os.path.isdir(labels_dir):
-        label_file_lists[split] = sorted(glob.glob(os.path.join(labels_dir, "*.png")))[:len(image_file_lists[split])]
+        label_file_lists[split] = sorted(glob.glob(os.path.join(labels_dir, "*.png")))[
+            : len(image_file_lists[split])
+        ]
     else:
         label_file_lists[split] = [None] * len(image_file_lists[split])
 
@@ -207,7 +209,8 @@ train_dataset = MapillaryDataset(
     num_classes=num_classes,
     image_size=224,
 )
-val_dataset = MapillaryDataset(
+# Use validation set for both validation and testing
+val_dataset_full = MapillaryDataset(
     image_files=image_file_lists["validation"],
     label_files=label_file_lists["validation"],
     processor=processor,
@@ -215,15 +218,16 @@ val_dataset = MapillaryDataset(
     num_classes=num_classes,
     image_size=224,
 )
-test_dataset = MapillaryDataset(
-    image_files=image_file_lists["testing"],
-    label_files=label_file_lists["testing"],
-    processor=processor,
-    patch_size=patch_size,
-    num_classes=num_classes,
-    image_size=224,
-)
 
+# Split validation: 80% val, 20% test
+from torch.utils.data import random_split
+
+val_size = int(0.8 * len(val_dataset_full))
+test_size = len(val_dataset_full) - val_size
+
+val_dataset, test_dataset = random_split(
+    val_dataset_full, [val_size, test_size], generator=torch.Generator().manual_seed(42)
+)
 print(f"Train set: {len(train_dataset)} images")
 print(f"Validation set: {len(val_dataset)} images")
 print(f"Test set: {len(test_dataset)} images")
@@ -424,7 +428,7 @@ for epoch in range(epochs):
         print(f"✓ Saved best model with val_loss: {val_loss:.4f}")
 
 # --- TESTING ---
-if len([l for l in label_file_lists['testing'] if l is not None]) > 0:
+if len([l for l in label_file_lists["testing"] if l is not None]) > 0:
     print("\n=== Testing on Test Set ===")
     test_loss = validate(-1, model, seg_head, test_loader, criterion, device)
     print(f"Test Loss: {test_loss:.4f}")
