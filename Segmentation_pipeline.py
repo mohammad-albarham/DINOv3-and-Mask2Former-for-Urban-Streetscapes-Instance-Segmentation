@@ -42,13 +42,29 @@ splits = ["training", "validation", "testing"]
 image_file_lists = {}
 label_file_lists = {}
 
+# Control how many images to use from each split
+# I can use None for full dataset 
+MAX_TRAIN = 1000 # None if you want full dataset
+MAX_VAL = 200
+MAX_TEST = 100
+
 for split in splits:
     images_dir = os.path.join(dataset_root, split, "images")
     labels_dir = os.path.join(dataset_root, split, "v2.0", "labels")
+    
+    # Slice the lists to control size
     image_file_lists[split] = sorted(glob.glob(os.path.join(images_dir, "*.jpg")))
-    # Only assign label files if they exist (testing may lack labels)
+    
+    if split == 'training':
+        image_file_lists[split] = image_file_lists[split][:MAX_TRAIN]
+    elif split == 'validation':
+        image_file_lists[split] = image_file_lists[split][:MAX_VAL]
+    elif split == 'testing':
+        image_file_lists[split] = image_file_lists[split][:MAX_TEST]
+    
+    # Match label files to images
     if os.path.isdir(labels_dir):
-        label_file_lists[split] = sorted(glob.glob(os.path.join(labels_dir, "*.png")))
+        label_file_lists[split] = sorted(glob.glob(os.path.join(labels_dir, "*.png")))[:len(image_file_lists[split])]
     else:
         label_file_lists[split] = [None] * len(image_file_lists[split])
 
@@ -408,10 +424,14 @@ for epoch in range(epochs):
         print(f"✓ Saved best model with val_loss: {val_loss:.4f}")
 
 # --- TESTING ---
-print("\n=== Testing on Test Set ===")
-test_loss = validate(-1, model, seg_head, test_loader, criterion, device)
-print(f"Test Loss: {test_loss:.4f}")
-wandb.log({"test_loss": test_loss})
+if len([l for l in label_file_lists['testing'] if l is not None]) > 0:
+    print("\n=== Testing on Test Set ===")
+    test_loss = validate(-1, model, seg_head, test_loader, criterion, device)
+    print(f"Test Loss: {test_loss:.4f}")
+    wandb.log({"test_loss": test_loss})
+else:
+    print("\n=== Test set has no public labels, skipping evaluation ===")
+
 
 # --- VISUALIZE RESULTS ---
 seg_head.eval()
