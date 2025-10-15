@@ -29,3 +29,7 @@ wandb/*
 *.csv
 settings.json
 *lock
+*.pth
+*pt
+*.safetensors
+*.lock
