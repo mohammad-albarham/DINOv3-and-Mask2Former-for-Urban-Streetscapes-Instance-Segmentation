@@ -12,6 +12,7 @@ import wandb
 from torch.utils.data import Dataset, DataLoader, random_split
 from tqdm import tqdm
 
+
 DEBUG = False
 
 
@@ -24,6 +25,7 @@ def rprint_debug(*args, **kwargs):
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 rprint_debug(f"Using device: {device}")
 
+
 if torch.backends.mps.is_available():
     rprint_debug("✓ MPS (Metal Performance Shaders) available")
     rprint_debug(f"✓ PyTorch version: {torch.__version__}")
@@ -35,24 +37,26 @@ if torch.backends.mps.is_available():
     except:
         rprint_debug("✓ MPS memory tracking available after first allocation")
 
+
 # --- DATASET PATHS ---
 dataset_root = "./mapillary_dataset"
 splits = ["training", "validation", "testing"]
 
+
 image_file_lists = {}
 label_file_lists = {}
 
+
 # Control how many images to use from each split
-# I can use None for full dataset
-MAX_TRAIN = 1000  # None if you want full dataset
+MAX_TRAIN = 1000
 MAX_VAL = 200
 MAX_TEST = 100
+
 
 for split in splits:
     images_dir = os.path.join(dataset_root, split, "images")
     labels_dir = os.path.join(dataset_root, split, "v2.0", "labels")
 
-    # Slice the lists to control size
     image_file_lists[split] = sorted(glob.glob(os.path.join(images_dir, "*.jpg")))
 
     if split == "training":
@@ -62,7 +66,6 @@ for split in splits:
     elif split == "testing":
         image_file_lists[split] = image_file_lists[split][:MAX_TEST]
 
-    # Match label files to images
     if os.path.isdir(labels_dir):
         label_file_lists[split] = sorted(glob.glob(os.path.join(labels_dir, "*.png")))[
             : len(image_file_lists[split])
@@ -74,8 +77,10 @@ for split in splits:
 # --- LABEL CONFIG ---
 with open("./mapillary_dataset/config_v2.0.json", "r") as f:
     config = json.load(f)
+
 labels_config = config["labels"]
 num_classes = len(labels_config)
+
 
 rprint_debug(f"num of classes: {num_classes}")
 
@@ -89,23 +94,12 @@ class MapillaryDataset(Dataset):
         image_files,
         label_files,
         processor,
-        patch_size=16,
         num_classes=num_classes,
         image_size=224,
     ):
-        """
-        Args:
-            image_files: List of image file paths
-            label_files: List of label file paths
-            processor: Image processor from transformers
-            patch_size: Size of patches for segmentation
-            num_classes: Number of segmentation classes
-            image_size: Target image size
-        """
         self.image_files = image_files
         self.label_files = label_files
         self.processor = processor
-        self.patch_size = patch_size
         self.num_classes = num_classes
         self.image_size = image_size
 
@@ -120,35 +114,27 @@ class MapillaryDataset(Dataset):
             .resize((self.image_size, self.image_size))
         )
 
-        # Load and preprocess label
+        # Load and preprocess label - now at FULL resolution
         label = Image.open(self.label_files[idx]).resize(
             (self.image_size, self.image_size), resample=Image.NEAREST
         )
         label_np = np.array(label)
 
-        # Get patch labels
-        patch_labels = self.get_patch_labels(label_np)
+        # Clamp labels to valid range
+        label_np[label_np >= self.num_classes] = 255
+
+        # Flatten to [H*W] for pixel-wise loss
+        pixel_labels = label_np.flatten()
 
         # Process image for model
         inputs = self.processor(images=image, return_tensors="pt")
-        pixel_values = inputs["pixel_values"].squeeze(0)  # Remove batch dim
+        pixel_values = inputs["pixel_values"].squeeze(0)
 
         return {
             "pixel_values": pixel_values,
-            "labels": torch.from_numpy(patch_labels).long(),
+            "labels": torch.from_numpy(pixel_labels).long(),
             "image_path": self.image_files[idx],
         }
-
-    def get_patch_labels(self, label_np):
-        h, w = label_np.shape
-        grid_h, grid_w = h // self.patch_size, w // self.patch_size
-        mask_tensor = torch.from_numpy(label_np)[None, None].float()
-        patch_labels_tensor = F.interpolate(
-            mask_tensor, size=(grid_h, grid_w), mode="nearest"
-        )[0, 0].long()
-        patch_labels = patch_labels_tensor.view(-1).numpy()
-        patch_labels[patch_labels >= self.num_classes] = 255
-        return patch_labels
 
 
 # --- VIT BACKBONE ---
@@ -166,33 +152,88 @@ patch_size = model.config.patch_size
 
 def extract_patch_features(pixel_values, num_register_tokens=0):
     """Extract patch features from preprocessed pixel values"""
-    # pixel_values already on correct device from dataloader
     with torch.no_grad():
         outputs = model(pixel_values=pixel_values)
 
     # Return patch features (excluding CLS and register tokens)
     patch_features = outputs.last_hidden_state[:, 1 + num_register_tokens :, :]
-    return patch_features  # [batch_size, n_patches, dim]
+    return patch_features
 
 
-# --- SEGMENTATION HEAD ---
-class SegmentationHead_mapillary(nn.Module):
+# --- SEGFORMER DECODER ---
+class SegFormerDecoder(nn.Module):
+    """
+    SegFormer-style decoder with MLP layers and progressive upsampling.
+    Based on: https://arxiv.org/abs/2105.15203
+    """
+
     def __init__(self, input_dim=384, num_classes=num_classes, hidden_dim=256):
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+
+        # Linear projection to reduce dimensionality
+        self.linear_c = nn.Linear(input_dim, hidden_dim)
+
+        # Fusion module with convolutions
+        self.linear_fuse = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, num_classes),
         )
+
+        # Additional refinement layers
+        self.refine = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(0.1),
+        )
+
+        # Final prediction head
+        self.linear_pred = nn.Conv2d(hidden_dim, num_classes, kernel_size=1)
 
     def forward(self, x):
         # x: [batch_size, n_patches, input_dim]
-        logits = self.mlp(x)  # [batch_size, n_patches, num_classes]
+        batch_size, n_patches, C = x.shape
+        grid_size = int(np.sqrt(n_patches))
+
+        # Linear projection
+        c = self.linear_c(x)  # [B, N, hidden_dim]
+
+        # Reshape to spatial [B, C, H, W] - ensure contiguous after transpose
+        c = c.transpose(1, 2).contiguous().reshape(batch_size, -1, grid_size, grid_size)
+        # [B, 196, 256] → [B, 256, 196] → [B, 256, 14, 14]
+
+        # Fuse features
+        c = self.linear_fuse(c)
+
+        # Refine features
+        c = self.refine(c)
+
+        # Predict at patch resolution
+        logits = self.linear_pred(c)  # [B, num_classes, H, W]
+        # [B, 256, 14, 14] → [B, num_classes, 14, 14]
+
+        # Upsample to original resolution (224x224)
+        # https://mriquestions.com/upsampling.html
+        # https://visionbook.mit.edu/upsamplig_downsampling_2.html
+        # https://bartwronski.com/2021/02/15/bilinear-down-upsampling-pixel-grids-and-that-half-pixel-offset/
+
+        logits = F.interpolate(
+            logits, size=(224, 224), mode="bilinear", align_corners=False
+        )
+        # [B, num_classes, 14, 14] → [B, num_classes, 224, 224]
+
+        # Reshape for loss computation: [B, 224*224, num_classes]
+        # Ensure contiguous before reshaping
+        logits = (
+            logits.permute(0, 2, 3, 1).contiguous().reshape(batch_size, 224 * 224, -1)
+        )
+        # [B, num_classes, 224, 224] → [B, 224, 224, num_classes] → [B, 50176, num_classes]
+
         return logits
 
 
-seg_head = SegmentationHead_mapillary(input_dim=384, num_classes=num_classes)
+seg_head = SegFormerDecoder(input_dim=384, num_classes=num_classes, hidden_dim=256)
 seg_head = seg_head.to(device)
 rprint_debug(f"Segmentation head loaded on: {next(seg_head.parameters()).device}")
 
@@ -205,23 +246,19 @@ train_dataset = MapillaryDataset(
     image_files=image_file_lists["training"],
     label_files=label_file_lists["training"],
     processor=processor,
-    patch_size=patch_size,
     num_classes=num_classes,
     image_size=224,
 )
-# Use validation set for both validation and testing
+
 val_dataset_full = MapillaryDataset(
     image_files=image_file_lists["validation"],
     label_files=label_file_lists["validation"],
     processor=processor,
-    patch_size=patch_size,
     num_classes=num_classes,
     image_size=224,
 )
 
 # Split validation: 80% val, 20% test
-from torch.utils.data import random_split
-
 val_size = int(0.8 * len(val_dataset_full))
 test_size = len(val_dataset_full) - val_size
 
@@ -234,9 +271,8 @@ print(f"Test set: {len(test_dataset)} images")
 
 
 # --- DATALOADERS ---
-
-batch_size = 64  # Adjust as needed
-num_workers = 0  # Set to >0 for CPU/CUDA
+batch_size = 128
+num_workers = 0
 
 train_loader = DataLoader(
     train_dataset,
@@ -260,16 +296,15 @@ test_loader = DataLoader(
     pin_memory=False,
 )
 
+
 # --- WANDB CONFIG ---
-
-epochs = 1
-
+epochs = 10
 
 wandb_config = {
     "learning_rate": optimizer.param_groups[0]["lr"],
-    "architecture": "ViT-patch-head",
+    "architecture": "SegFormer-Decoder",
     "backbone": model_name,
-    "seg_head_hidden_dim": seg_head.mlp[0].out_features,
+    "seg_head_hidden_dim": seg_head.linear_c.out_features,
     "dataset": "MapillaryVistas",
     "input_res": 224,
     "patch_size": 16,
@@ -285,15 +320,15 @@ wandb_config = {
     "device": str(device),
 }
 
-run_name = f"{model_name}-patch{wandb_config['patch_size']}-{wandb_config['architecture']}-E{wandb_config['epochs']}-BS{batch_size}-LR{wandb_config['learning_rate']}"
+run_name = f"{model_name}-patch{wandb_config['patch_size']}-SegFormer-E{wandb_config['epochs']}-BS{batch_size}-LR{wandb_config['learning_rate']}"
 
 run = wandb.init(
     entity="albarham-chalmers",
     project="segmentation-project",
     name=run_name,
     config=wandb_config,
-    tags=["segmentation", "ViT", "Mapillary", "10k-images", "GPU"],
-    save_code=True,  # Saves the current script
+    tags=["segmentation", "ViT", "Mapillary", "SegFormer-Decoder", "GPU"],
+    save_code=True,
 )
 
 
@@ -301,7 +336,7 @@ run = wandb.init(
 def train_one_epoch(epoch, model, seg_head, train_loader, optimizer, criterion, device):
     """Train for one epoch"""
     seg_head.train()
-    model.eval()  # Keep backbone frozen
+    model.eval()
 
     total_loss = 0
     num_batches = 0
@@ -309,7 +344,6 @@ def train_one_epoch(epoch, model, seg_head, train_loader, optimizer, criterion, 
     progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs} [Train]")
 
     for batch in progress_bar:
-        # Move batch to device
         pixel_values = batch["pixel_values"].to(device)
         labels = batch["labels"].to(device)
 
@@ -320,12 +354,12 @@ def train_one_epoch(epoch, model, seg_head, train_loader, optimizer, criterion, 
 
         # Forward pass
         optimizer.zero_grad()
-        logits = seg_head(patch_features)  # [batch_size, n_patches, num_classes]
+        logits = seg_head(patch_features)  # [batch_size, 224*224, num_classes]
 
         # Reshape for loss calculation
-        batch_size, n_patches, n_classes = logits.shape
-        logits_flat = logits.view(batch_size * n_patches, n_classes)
-        labels_flat = labels.view(batch_size * n_patches)
+        batch_size, n_pixels, n_classes = logits.shape
+        logits_flat = logits.reshape(batch_size * n_pixels, n_classes)
+        labels_flat = labels.reshape(batch_size * n_pixels)
 
         # Compute loss
         loss = criterion(logits_flat, labels_flat)
@@ -338,16 +372,9 @@ def train_one_epoch(epoch, model, seg_head, train_loader, optimizer, criterion, 
         total_loss += loss.item()
         num_batches += 1
 
-        # Update progress bar
         progress_bar.set_postfix({"loss": loss.item()})
 
-        # Log to wandb
-        wandb.log(
-            {
-                "batch_loss": loss.item(),
-                "epoch": epoch,
-            }
-        )
+        wandb.log({"batch_loss": loss.item(), "epoch": epoch})
 
     avg_loss = total_loss / num_batches
     return avg_loss
@@ -363,7 +390,6 @@ def validate(epoch, model, seg_head, val_loader, criterion, device):
 
     with torch.no_grad():
         for batch in tqdm(val_loader, desc=f"Epoch {epoch + 1}/{epochs} [Val]"):
-            # Move batch to device
             pixel_values = batch["pixel_values"].to(device)
             labels = batch["labels"].to(device)
 
@@ -376,9 +402,9 @@ def validate(epoch, model, seg_head, val_loader, criterion, device):
             logits = seg_head(patch_features)
 
             # Reshape for loss calculation
-            batch_size, n_patches, n_classes = logits.shape
-            logits_flat = logits.view(batch_size * n_patches, n_classes)
-            labels_flat = labels.view(batch_size * n_patches)
+            batch_size, n_pixels, n_classes = logits.shape
+            logits_flat = logits.reshape(batch_size * n_pixels, n_classes)
+            labels_flat = labels.reshape(batch_size * n_pixels)
 
             # Compute loss
             loss = criterion(logits_flat, labels_flat)
@@ -405,13 +431,7 @@ for epoch in range(epochs):
     print(
         f"Epoch {epoch + 1}/{epochs} - Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}"
     )
-    wandb.log(
-        {
-            "epoch": epoch,
-            "train_loss": train_loss,
-            "val_loss": val_loss,
-        }
-    )
+    wandb.log({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
 
     # Save best model
     if val_loss < best_val_loss:
@@ -423,25 +443,23 @@ for epoch in range(epochs):
                 "optimizer_state_dict": optimizer.state_dict(),
                 "val_loss": val_loss,
             },
-            "best_model.pth",
+            "best_model_segformer.pth",
         )
         print(f"✓ Saved best model with val_loss: {val_loss:.4f}")
 
+
 # --- TESTING ---
-if len([l for l in label_file_lists["testing"] if l is not None]) > 0:
-    print("\n=== Testing on Test Set ===")
-    test_loss = validate(-1, model, seg_head, test_loader, criterion, device)
-    print(f"Test Loss: {test_loss:.4f}")
-    wandb.log({"test_loss": test_loss})
-else:
-    print("\n=== Test set has no public labels, skipping evaluation ===")
+# Evaluate on our test split (created from validation set)
+print("\n=== Testing on Test Set (from validation split) ===")
+test_loss = validate(-1, model, seg_head, test_loader, criterion, device)
+print(f"Test Loss: {test_loss:.4f}")
+wandb.log({"test_loss": test_loss})
 
 
 # --- VISUALIZE RESULTS ---
 seg_head.eval()
 model.eval()
 
-# Visualize a few test samples
 num_vis_samples = min(10, len(test_dataset))
 test_samples_indices = np.random.choice(
     len(test_dataset), num_vis_samples, replace=False
@@ -464,21 +482,11 @@ for idx, sample_idx in enumerate(test_samples_indices):
         patch_features = extract_patch_features(
             pixel_values, num_register_tokens=model.config.num_register_tokens
         )
-        logits = seg_head(patch_features)
+        logits = seg_head(patch_features)  # [1, 224*224, num_classes]
         seg_pred = torch.argmax(logits, dim=-1).cpu().numpy()[0]
 
-    # Reshape prediction
-    grid_size = int(np.sqrt(len(seg_pred)))
-    seg_map_patches = seg_pred.reshape((grid_size, grid_size))
-    seg_map_upsampled = (
-        F.interpolate(
-            torch.from_numpy(seg_map_patches)[None, None, :, :].float(),
-            size=(224, 224),
-            mode="nearest",
-        )[0, 0]
-        .numpy()
-        .astype(np.uint8)
-    )
+    # Reshape prediction to 224x224
+    seg_map_upsampled = seg_pred.reshape((224, 224)).astype(np.uint8)
 
     # Create visualization
     fig, axes = plt.subplots(1, 3, figsize=(12, 4))
