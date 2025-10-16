@@ -50,19 +50,18 @@ from PIL import Image
 import transformers
 from transformers import (
     AutoImageProcessor,
-    AutoModelForUniversalSegmentation,
     SchedulerType,
     get_scheduler,
 )
 from transformers.image_processing_utils import BatchFeature
-from transformers.utils import check_min_version, send_example_telemetry
+from transformers.utils import check_min_version
+
 from transformers.utils.versions import require_version
 
-import torch.nn as nn
-from typing import List, Dict
 import importlib.util
-import sys
-import os
+
+
+import glob
 
 logger = logging.getLogger(__name__)
 
@@ -122,129 +121,135 @@ def load_model_from_config(model_path: str):
 require_version("datasets>=2.0.0", "To fix: pip install -r examples/pytorch/instance-segmentation/requirements.txt")
 
 
-# ===================== COCO Dataset Class =====================
-class COCOInstanceDataset(Dataset):
-    """COCO dataset optimized for instance segmentation"""
-    
-    def __init__(self, data_dir, split, image_processor, transform=None, use_cache=True):
-        self.data_dir = Path(data_dir)
-        self.split = split
+class MapillaryInstanceDataset(Dataset):
+    """
+    Mapillary Vistas Dataset for Instance Segmentation
+    """
+    def __init__(self, root_dir, image_processor, version='v2.0', split='training', transforms=None):
+        """
+        Args:
+            root_dir: Root directory containing the dataset
+            version: Dataset version ('v1.2' or 'v2.0')
+            split: 'training' or 'validation'
+            transforms: Transformations to apply
+        """
+        self.root_dir = root_dir
         self.image_processor = image_processor
-        self.transform = transform
-        
-        ann_file = self.data_dir / split / "_annotations.coco.json"
-        cache_file = self.data_dir / split / "_cache.pkl"
-        
-        if not ann_file.exists():
-            raise FileNotFoundError(f"Annotation file not found: {ann_file}")
-        
-        # Cache handling
-        if use_cache and cache_file.exists():
-            logger.info(f"Loading cached annotations from {cache_file}")
-            with open(cache_file, 'rb') as f:
-                cache_data = pickle.load(f)
-                self.image_ids = cache_data['image_ids']
-                self.annotations = cache_data['annotations']
-                self.categories = cache_data['categories']
-                self.coco = None  # Don't need COCO object when using cache
-        else:
-            logger.info(f"Building annotation cache for {split}")
-            self.coco = COCO(ann_file)
-            self.image_ids = list(self.coco.imgs.keys())
-            self.categories = {cat['id']: cat['name'] 
-                              for cat in self.coco.loadCats(self.coco.getCatIds())}
-            
-            # Pre-process annotations
-            self.annotations = {}
-            for idx, img_id in enumerate(tqdm(self.image_ids, desc="Caching annotations")):
-                img_info = self.coco.loadImgs(img_id)[0]
-                ann_ids = self.coco.getAnnIds(imgIds=img_id)
-                anns = self.coco.loadAnns(ann_ids)
-                
-                self.annotations[img_id] = {
-                    'file_name': img_info['file_name'],
-                    'height': img_info['height'],
-                    'width': img_info['width'],
-                    'anns': anns  # Keep annotations, generate masks on demand
-                }
-            
-            # Save cache
-            if use_cache:
-                cache_data = {
-                    'image_ids': self.image_ids,
-                    'annotations': self.annotations,
-                    'categories': self.categories
-                }
-                with open(cache_file, 'wb') as f:
-                    pickle.dump(cache_data, f)
-                logger.info(f"Cache saved to {cache_file}")
-    
+        self.version = version
+        self.split = split
+        self.transforms = transforms
+
+        # Load config file to get label information
+        config_path = os.path.join(root_dir, f'config_{version}.json')
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        self.labels = config['labels']
+
+        # Get only "thing" classes (classes with instances)
+        self.thing_classes = [label for label in self.labels if label["instances"]]
+        self.label_id_to_class_id = {}
+
+        # Create mapping from original label_id to class_id (1-indexed for PyTorch)
+        # Class 0 is reserved for background
+        self.categories = {}
+        for class_id, label in enumerate(self.labels):
+            if label["instances"]:
+                # +1 because 0 is background
+                self.label_id_to_class_id[class_id] = len([l for l in self.labels[:class_id+1] if l["instances"]])
+                self.categories[self.label_id_to_class_id[class_id]] = label["readable"]
+
+        # Get all image IDs
+        images_dir = os.path.join(root_dir, split, 'images')
+        self.image_files = sorted(glob.glob(os.path.join(images_dir, '*.jpg')))
+        self.image_ids = [os.path.splitext(os.path.basename(f))[0] for f in self.image_files]
+
+        N = 100
+        self.image_ids = self.image_ids[:N]  # Only use first N
+        self.image_files = self.image_files[:N]
+
+        print(f"Loaded {len(self.image_ids)} images from {split} split")
+        print(f"Number of thing classes (with instances): {len(self.thing_classes)}")
+
     def __len__(self):
         return len(self.image_ids)
-    
+
     def __getitem__(self, idx):
-        img_id = self.image_ids[idx]
-        ann_data = self.annotations[img_id]
-        
+        image_id = self.image_ids[idx]
+
         # Load image
-        img_path = self.data_dir / self.split / ann_data['file_name']
-        image = Image.open(img_path).convert('RGB')
-        
-        # Generate masks on-demand
-        h, w = ann_data['height'], ann_data['width']
-        instance_mask = np.zeros((h, w), dtype=np.int32)
+        image_path = os.path.join(self.root_dir, self.split, 'images', f'{image_id}.jpg')
+        image = Image.open(image_path).convert('RGB')
+        h, w = image.height, image.width
+
+        # Load instance image
+        instance_path = os.path.join(self.root_dir, self.split, self.version, 'instances', f'{image_id}.png')
+        instance_image = Image.open(instance_path)
+        instance_array = np.array(instance_image, dtype=np.uint16)
+
+        # Create instance mask with only "thing" classes
+        instance_mask = np.zeros_like(instance_array, dtype=np.uint16)
+
         instance_to_semantic = {}
-        
-        for i, ann in enumerate(ann_data['anns'], 1):
-            if 'segmentation' in ann:
-                if self.coco:
-                    mask = self.coco.annToMask(ann)
-                else:
-                    mask = self._poly_to_mask(ann['segmentation'], h, w)
-                instance_mask[mask > 0] = i
-                instance_to_semantic[i] = ann['category_id']
-        
-        # Apply transforms
-        if self.transform:
+
+        inst_id_counter = 1
+        for inst_value in np.unique(instance_array):
+            if inst_value == 0:
+                continue
+            label_id = inst_value // 256
+            # Only keep "thing" classes
+            if not self.labels[label_id]["instances"]:
+                continue
+            # Assign contiguous instance IDs (1, 2, 3, ...)
+            instance_mask[instance_array == inst_value] = inst_id_counter
+            # Map back to its semantic class
+            class_id = self.label_id_to_class_id.get(label_id, 0)
+            instance_to_semantic[inst_id_counter] = class_id
+            inst_id_counter += 1
+
+        # Save mapping for use after transforms
+        orig_instance_to_semantic = instance_to_semantic.copy()
+
+        # Apply transforms if provided
+        if self.transforms is not None:
             image_np = np.array(image)
-            output = self.transform(image=image_np, mask=instance_mask)
+            output = self.transforms(image=image_np, mask=instance_mask)
             image = output["image"]
             instance_mask = output["mask"]
-            
-            # Remap instance IDs after augmentation
+
             unique_ids = np.unique(instance_mask)
+            # Only keep instance IDs that existed before transforms
             instance_to_semantic = {
-                int(inst_id): instance_to_semantic.get(inst_id, 0)
-                for inst_id in unique_ids if inst_id > 0
+                int(inst_id): orig_instance_to_semantic[int(inst_id)]
+                for inst_id in unique_ids
+                if inst_id > 0 and int(inst_id) in orig_instance_to_semantic
             }
         else:
             image = np.array(image)
-        
-        # Apply image processor
+
+        # Remove background key from mapping if present (robust fix)
+        if 0 in instance_to_semantic:
+            del instance_to_semantic[0]
+        assert 0 not in instance_to_semantic, "Instance mapping incorrectly includes background!"
+
+        # Apply image processor (final step)
+        instance_mask = instance_mask.astype(np.int32) 
         inputs = self.image_processor(
             images=[image],
             segmentation_maps=[instance_mask],
             instance_id_to_semantic_id=instance_to_semantic,
             return_tensors="pt",
         )
-        
+
         return {
             "pixel_values": inputs.pixel_values[0],
             "mask_labels": inputs.mask_labels[0],
             "class_labels": inputs.class_labels[0],
-            "original_size": (h, w),  # 원본 크기 추가
+            "original_size": (h, w),
         }
-    
-    @staticmethod
-    def _poly_to_mask(polygons, h, w):
-        """Convert polygon to mask without COCO"""
-        import cv2
-        mask = np.zeros((h, w), dtype=np.uint8)
-        for polygon in polygons:
-            if len(polygon) % 2 == 0 and len(polygon) >= 6:
-                pts = np.array(polygon).reshape(-1, 2).astype(np.int32)
-                cv2.fillPoly(mask, [pts], 1)
-        return mask
+
+    def get_num_classes(self):
+        """Returns number of classes including background"""
+        return len(self.thing_classes) + 1  # +1 for background
 
 
 def augment_and_transform_batch(
@@ -260,20 +265,20 @@ def augment_and_transform_batch(
         image = np.array(pil_image)
         semantic_and_instance_masks = np.array(pil_annotation)[..., :2]
 
-        # Apply augmentations
         output = transform(image=image, mask=semantic_and_instance_masks)
-
         aug_image = output["image"]
         aug_semantic_and_instance_masks = output["mask"]
         aug_instance_mask = aug_semantic_and_instance_masks[..., 1]
 
-        # Create mapping from instance id to semantic id
+        # Mapping for foreground only
         unique_semantic_id_instance_id_pairs = np.unique(aug_semantic_and_instance_masks.reshape(-1, 2), axis=0)
         instance_id_to_semantic_id = {
-            instance_id: semantic_id for semantic_id, instance_id in unique_semantic_id_instance_id_pairs
+            int(instance_id): int(semantic_id)
+            for semantic_id, instance_id in unique_semantic_id_instance_id_pairs
+            if instance_id > 0
         }
+        assert 0 not in instance_id_to_semantic_id, "Background (instance_id=0) included in mapping!"
 
-        # Apply the image processor transformations: resizing, rescaling, normalization
         model_inputs = image_processor(
             images=[aug_image],
             segmentation_maps=[aug_instance_mask],
@@ -430,10 +435,10 @@ def parse_args():
         help="Path to JSON config file containing training arguments"
     )
 
-    # 임시로 config 인자만 먼저 파싱합니다.
+    # Temporarily parse only the config argument first.
     temp_args, _ = parser.parse_known_args()
 
-    # 기본값을 담을 딕셔너리
+    # A dictionary containing default values
     defaults = {}
     if temp_args.config:
         with open(temp_args.config, 'r') as f:
@@ -448,7 +453,7 @@ def parse_args():
     parser.add_argument(
         "--dataset_name",
         type=str,
-        help="Name of the dataset on the hub or path to local COCO dataset.",
+        help="Name of the dataset on the hub or path to mapillary dataset.",
         
     )
     parser.add_argument(
@@ -497,7 +502,7 @@ def parse_args():
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
-        default=4,
+        default=0,
         help="Number of workers to use for the dataloaders.",
     )
     parser.add_argument(
@@ -603,7 +608,7 @@ def main():
 
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
-    send_example_telemetry("run_instance_segmentation_no_trainer", args)
+    # send_example_telemetry("run_instance_segmentation_no_trainer", args)
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
     accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps, kwargs_handlers=[ddp_kwargs])
@@ -621,9 +626,11 @@ def main():
         api = HfApi()
 
     # ------------------------------------------------------------------------------------------------
-    # Load dataset, prepare splits - MODIFIED FOR COCO SUPPORT
+    # Load dataset, prepare splits - MODIFIED FOR MAPILLARY DATASET
     # ------------------------------------------------------------------------------------------------
     
+
+    #TODO: Edit the dataset loading here
     # Check if dataset_name is a local directory (COCO dataset)
     if Path(args.dataset_name).is_dir():
         logger.info(f"Loading local COCO dataset from {args.dataset_name}")
@@ -636,6 +643,7 @@ def main():
             do_reduce_labels=args.do_reduce_labels,
             reduce_labels=args.do_reduce_labels,
             token=args.hub_token,
+            use_fast=True
         )
         
         # Define augmentations
@@ -644,22 +652,22 @@ def main():
         val_transform = A.Compose([A.NoOp()])
         
         # Create datasets
-        train_dataset = COCOInstanceDataset(
+        train_dataset = MapillaryInstanceDataset(
             args.dataset_name,
-            "train",
             image_processor,
-            transform=train_transform,
-            use_cache=True
+            split='training',
+            transforms=train_transform,
         )
+
         
         # Try to load validation set, if not available use subset of training
         try:
-            val_dataset = COCOInstanceDataset(
+            val_dataset = MapillaryInstanceDataset(
                 args.dataset_name,
-                "valid",
                 image_processor,
-                transform=val_transform,
-                use_cache=True
+                "validation",
+                split=image_processor,
+                transforms=val_transform,
             )
         except FileNotFoundError:
             logger.warning("Validation dataset not found. Using 10% of training set.")
@@ -752,7 +760,7 @@ def main():
     dataloader_common_args = {
         "num_workers": args.dataloader_num_workers,
         "persistent_workers": args.dataloader_num_workers > 0,
-        "pin_memory": True,
+        "pin_memory": False,
         "collate_fn": collate_fn,
     }
     
@@ -874,7 +882,10 @@ def main():
     progress_bar.update(completed_steps)
 
     for epoch in range(starting_epoch, args.num_train_epochs):
+
         model.train()
+
+
         if args.resume_from_checkpoint and epoch == starting_epoch and resume_step is not None:
             # We skip the first `n` batches in the dataloader when resuming from a checkpoint
             active_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
@@ -884,8 +895,8 @@ def main():
         for step, batch in enumerate(active_dataloader):
             with accelerator.accumulate(model):
                 # ================== FIX START ==================
-                # 모델이 예상하지 않는 'original_sizes' 인자를 제거합니다.
-                # 이 정보는 평가 시에만 필요합니다.
+                # Remove the 'original_sizes' argument, which the model does not expect.
+                # This information is only required for evaluation purposes.
                 if "original_sizes" in batch:
                     batch.pop("original_sizes")
                 # ================== FIX END ====================

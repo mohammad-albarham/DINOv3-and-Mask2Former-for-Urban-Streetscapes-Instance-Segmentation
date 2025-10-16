@@ -33,3 +33,4 @@ settings.json
 *pt
 *.safetensors
 *.lock
+*.json
