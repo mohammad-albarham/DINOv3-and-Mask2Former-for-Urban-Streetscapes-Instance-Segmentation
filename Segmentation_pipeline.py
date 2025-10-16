@@ -11,6 +11,9 @@ import matplotlib.pyplot as plt
 import wandb
 from torch.utils.data import Dataset, DataLoader, random_split
 from tqdm import tqdm
+from safetensors.torch import save_file, load_file
+from safetensors import safe_open
+from datetime import datetime
 
 
 DEBUG = False
@@ -25,7 +28,6 @@ def rprint_debug(*args, **kwargs):
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 rprint_debug(f"Using device: {device}")
 
-
 if torch.backends.mps.is_available():
     rprint_debug("✓ MPS (Metal Performance Shaders) available")
     rprint_debug(f"✓ PyTorch version: {torch.__version__}")
@@ -37,21 +39,26 @@ if torch.backends.mps.is_available():
     except:
         rprint_debug("✓ MPS memory tracking available after first allocation")
 
+# --- CHECKPOINT DIRECTORY ---
+checkpoint_dir = "./checkpoints"
+os.makedirs(checkpoint_dir, exist_ok=True)
+
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+run_checkpoint_dir = os.path.join(checkpoint_dir, f"run_{timestamp}")
+os.makedirs(run_checkpoint_dir, exist_ok=True)
+rprint_debug(f"Checkpoint directory: {run_checkpoint_dir}")
 
 # --- DATASET PATHS ---
 dataset_root = "./mapillary_dataset"
 splits = ["training", "validation", "testing"]
 
-
 image_file_lists = {}
 label_file_lists = {}
-
 
 # Control how many images to use from each split
 MAX_TRAIN = 1000
 MAX_VAL = 200
 MAX_TEST = 100
-
 
 for split in splits:
     images_dir = os.path.join(dataset_root, split, "images")
@@ -73,14 +80,12 @@ for split in splits:
     else:
         label_file_lists[split] = [None] * len(image_file_lists[split])
 
-
 # --- LABEL CONFIG ---
 with open("./mapillary_dataset/config_v2.0.json", "r") as f:
     config = json.load(f)
 
 labels_config = config["labels"]
 num_classes = len(labels_config)
-
 
 rprint_debug(f"num of classes: {num_classes}")
 
@@ -164,7 +169,7 @@ def extract_patch_features(pixel_values, num_register_tokens=0):
 class SegFormerDecoder(nn.Module):
     """
     SegFormer-style decoder with MLP layers and progressive upsampling.
-    Based on: https://arxiv.org/abs/2105.15203
+    Based on: [https://arxiv.org/abs/2105.15203](https://arxiv.org/abs/2105.15203)
     """
 
     def __init__(self, input_dim=384, num_classes=num_classes, hidden_dim=256):
@@ -201,7 +206,6 @@ class SegFormerDecoder(nn.Module):
 
         # Reshape to spatial [B, C, H, W] - ensure contiguous after transpose
         c = c.transpose(1, 2).contiguous().reshape(batch_size, -1, grid_size, grid_size)
-        # [B, 196, 256] → [B, 256, 196] → [B, 256, 14, 14]
 
         # Fuse features
         c = self.linear_fuse(c)
@@ -210,25 +214,16 @@ class SegFormerDecoder(nn.Module):
         c = self.refine(c)
 
         # Predict at patch resolution
-        logits = self.linear_pred(c)  # [B, num_classes, H, W]
-        # [B, 256, 14, 14] → [B, num_classes, 14, 14]
-
-        # Upsample to original resolution (224x224)
-        # https://mriquestions.com/upsampling.html
-        # https://visionbook.mit.edu/upsamplig_downsampling_2.html
-        # https://bartwronski.com/2021/02/15/bilinear-down-upsampling-pixel-grids-and-that-half-pixel-offset/
+        logits = self.linear_pred(c)
 
         logits = F.interpolate(
             logits, size=(224, 224), mode="bilinear", align_corners=False
         )
-        # [B, num_classes, 14, 14] → [B, num_classes, 224, 224]
 
         # Reshape for loss computation: [B, 224*224, num_classes]
-        # Ensure contiguous before reshaping
         logits = (
             logits.permute(0, 2, 3, 1).contiguous().reshape(batch_size, 224 * 224, -1)
         )
-        # [B, num_classes, 224, 224] → [B, 224, 224, num_classes] → [B, 50176, num_classes]
 
         return logits
 
@@ -239,7 +234,6 @@ rprint_debug(f"Segmentation head loaded on: {next(seg_head.parameters()).device}
 
 optimizer = torch.optim.Adam(seg_head.parameters(), lr=1e-3)
 criterion = nn.CrossEntropyLoss(ignore_index=255)
-
 
 # --- DATASET CREATION ---
 train_dataset = MapillaryDataset(
@@ -269,7 +263,6 @@ print(f"Train set: {len(train_dataset)} images")
 print(f"Validation set: {len(val_dataset)} images")
 print(f"Test set: {len(test_dataset)} images")
 
-
 # --- DATALOADERS ---
 batch_size = 128
 num_workers = 0
@@ -296,9 +289,8 @@ test_loader = DataLoader(
     pin_memory=False,
 )
 
-
 # --- WANDB CONFIG ---
-epochs = 10
+epochs = 1
 
 wandb_config = {
     "learning_rate": optimizer.param_groups[0]["lr"],
@@ -318,6 +310,7 @@ wandb_config = {
     "test_size": len(test_dataset),
     "dataset_root": dataset_root,
     "device": str(device),
+    "checkpoint_format": "safetensors",
 }
 
 run_name = f"{model_name}-patch{wandb_config['patch_size']}-SegFormer-E{wandb_config['epochs']}-BS{batch_size}-LR{wandb_config['learning_rate']}"
@@ -327,7 +320,14 @@ run = wandb.init(
     project="segmentation-project",
     name=run_name,
     config=wandb_config,
-    tags=["segmentation", "ViT", "Mapillary", "SegFormer-Decoder", "GPU"],
+    tags=[
+        "segmentation",
+        "ViT",
+        "Mapillary",
+        "SegFormer-Decoder",
+        "GPU",
+        "safetensors",
+    ],
     save_code=True,
 )
 
@@ -354,7 +354,7 @@ def train_one_epoch(epoch, model, seg_head, train_loader, optimizer, criterion, 
 
         # Forward pass
         optimizer.zero_grad()
-        logits = seg_head(patch_features)  # [batch_size, 224*224, num_classes]
+        logits = seg_head(patch_features)
 
         # Reshape for loss calculation
         batch_size, n_pixels, n_classes = logits.shape
@@ -433,28 +433,119 @@ for epoch in range(epochs):
     )
     wandb.log({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
 
-    # Save best model
+    # Save best model using safetensors
     if val_loss < best_val_loss:
         best_val_loss = val_loss
+
+        # Prepare metadata (all values must be strings for safetensors)
+        metadata = {
+            "epoch": str(epoch),
+            "val_loss": f"{val_loss:.6f}",
+            "train_loss": f"{train_loss:.6f}",
+            "best_val_loss": f"{best_val_loss:.6f}",
+            "architecture": "SegFormer-Decoder",
+            "backbone": model_name,
+            "input_dim": "384",
+            "hidden_dim": "256",
+            "num_classes": str(num_classes),
+            "patch_size": str(patch_size),
+            "image_size": "224",
+            "learning_rate": str(optimizer.param_groups[0]["lr"]),
+            "batch_size": str(batch_size),
+        }
+
+        # Save model weights in safetensors format
+        model_path = os.path.join(
+            run_checkpoint_dir, f"best_model_epoch{epoch}.safetensors"
+        )
+        save_file(seg_head.state_dict(), model_path, metadata=metadata)
+
+        # Save optimizer state separately (torch format for non-tensor data)
+        optimizer_path = os.path.join(
+            run_checkpoint_dir, f"best_optimizer_epoch{epoch}.pt"
+        )
         torch.save(
             {
-                "epoch": epoch,
-                "model_state_dict": seg_head.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "epoch": epoch,
                 "val_loss": val_loss,
             },
-            "best_model_segformer.pth",
+            optimizer_path,
         )
-        print(f"✓ Saved best model with val_loss: {val_loss:.4f}")
 
+        # Log to WandB Artifacts
+        artifact = wandb.Artifact(
+            name="segformer-dinov3-model",
+            type="model",
+            description="SegFormer decoder with DINOv3 backbone (safetensors)",
+            metadata={
+                "format": "safetensors",
+                "epoch": epoch,
+                "val_loss": float(val_loss),
+                "train_loss": float(train_loss),
+                "num_classes": num_classes,
+                "architecture": "SegFormer-Decoder + DINOv3",
+            },
+        )
+        artifact.add_file(model_path)
+        artifact.add_file(optimizer_path)
+        run.log_artifact(artifact, aliases=["best", "latest", f"epoch_{epoch}"])
+
+        print(f"✓ Saved best model (safetensors) with val_loss: {val_loss:.4f}")
+        print(f"   Model: {model_path}")
+        print(f"   Optimizer: {optimizer_path}")
+
+# Save final model after training completes
+print("\n=== Saving Final Model ===")
+final_model_path = os.path.join(run_checkpoint_dir, "final_model.safetensors")
+final_optimizer_path = os.path.join(run_checkpoint_dir, "final_optimizer.pt")
+
+save_file(
+    seg_head.state_dict(),
+    final_model_path,
+    metadata={
+        "epoch": str(epochs - 1),
+        "final_train_loss": f"{train_loss:.6f}",
+        "final_val_loss": f"{val_loss:.6f}",
+        "best_val_loss": f"{best_val_loss:.6f}",
+        "architecture": "SegFormer-Decoder",
+        "backbone": model_name,
+        "num_classes": str(num_classes),
+    },
+)
+
+torch.save(
+    {
+        "optimizer_state_dict": optimizer.state_dict(),
+        "epoch": epochs - 1,
+    },
+    final_optimizer_path,
+)
+
+# Log final model to WandB
+final_artifact = wandb.Artifact(
+    name="segformer-dinov3-model",
+    type="model",
+    description="Final trained model (safetensors)",
+    metadata={
+        "format": "safetensors",
+        "final_val_loss": float(val_loss),
+        "best_val_loss": float(best_val_loss),
+    },
+)
+final_artifact.add_file(final_model_path)
+final_artifact.add_file(final_optimizer_path)
+run.log_artifact(final_artifact, aliases=["final"])
+
+print(f"✓ Saved final model")
+print(f"   Model: {final_model_path}")
+print(f"   Optimizer: {final_optimizer_path}")
 
 # --- TESTING ---
-# Evaluate on our test split (created from validation set)
 print("\n=== Testing on Test Set (from validation split) ===")
 test_loss = validate(-1, model, seg_head, test_loader, criterion, device)
 print(f"Test Loss: {test_loss:.4f}")
 wandb.log({"test_loss": test_loss})
-
 
 # --- VISUALIZE RESULTS ---
 seg_head.eval()
@@ -482,7 +573,7 @@ for idx, sample_idx in enumerate(test_samples_indices):
         patch_features = extract_patch_features(
             pixel_values, num_register_tokens=model.config.num_register_tokens
         )
-        logits = seg_head(patch_features)  # [1, 224*224, num_classes]
+        logits = seg_head(patch_features)
         seg_pred = torch.argmax(logits, dim=-1).cpu().numpy()[0]
 
     # Reshape prediction to 224x224
@@ -517,5 +608,50 @@ for idx, sample_idx in enumerate(test_samples_indices):
 
 run.finish()
 print("\nTraining complete!")
+print(f"All checkpoints saved in: {run_checkpoint_dir}")
+
+
+# --- HELPER FUNCTION TO LOAD MODEL ---
+def load_checkpoint_safetensors(
+    model_path, seg_head, optimizer=None, optimizer_path=None, device="cpu"
+):
+    """Load model and optimizer from safetensors checkpoint"""
+
+    # Load model weights
+    state_dict = load_file(model_path, device=str(device))
+    seg_head.load_state_dict(state_dict)
+
+    # Load and print metadata
+    with safe_open(model_path, framework="pt", device=str(device)) as f:
+        metadata = f.metadata()
+        print("=" * 50)
+        print("Loaded Model Checkpoint")
+        print("=" * 50)
+        for key, value in metadata.items():
+            print(f"{key}: {value}")
+        print("=" * 50)
+
+    # Load optimizer if provided
+    if (
+        optimizer is not None
+        and optimizer_path is not None
+        and os.path.exists(optimizer_path)
+    ):
+        optimizer_checkpoint = torch.load(optimizer_path, map_location=device)
+        optimizer.load_state_dict(optimizer_checkpoint["optimizer_state_dict"])
+        epoch = optimizer_checkpoint["epoch"]
+        print(f"✓ Loaded optimizer from epoch {epoch}")
+
+    return seg_head, optimizer
+
+
+# Example usage to load the best model:
+# seg_head_loaded, optimizer_loaded = load_checkpoint_safetensors(
+#     model_path='./checkpoints/run_20251015_113000/best_model_epoch9.safetensors',
+#     seg_head=seg_head,
+#     optimizer=optimizer,
+#     optimizer_path='./checkpoints/run_20251015_113000/best_optimizer_epoch9.pt',
+#     device=device
+# )
 
 # %%
