@@ -60,11 +60,16 @@ from transformers.utils.versions import require_version
 
 import importlib.util
 
+from models.mask2former_dinov3_vitsmallplus import Mask2Former_Dinov3
 
 import glob
 
 logger = logging.getLogger(__name__)
 
+from rich import traceback, pretty
+traceback.install(show_locals=True)
+
+pretty.install()
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.56.0.dev0")
 
@@ -163,9 +168,10 @@ class MapillaryInstanceDataset(Dataset):
         self.image_files = sorted(glob.glob(os.path.join(images_dir, '*.jpg')))
         self.image_ids = [os.path.splitext(os.path.basename(f))[0] for f in self.image_files]
 
-        N = 100
-        self.image_ids = self.image_ids[:N]  # Only use first N
-        self.image_files = self.image_files[:N]
+        N_train = 1
+        N_val = 1
+        self.image_ids = self.image_ids[:N_train]  # Only use first N
+        self.image_files = self.image_files[:N_val]
 
         print(f"Loaded {len(self.image_ids)} images from {split} split")
         print(f"Number of thing classes (with instances): {len(self.thing_classes)}")
@@ -431,7 +437,7 @@ def parse_args():
     parser.add_argument(
         "--config",
         type=str,
-        default=None,
+        default="mask2former-dinov3_smallplus_1024_train_args.json",
         help="Path to JSON config file containing training arguments"
     )
 
@@ -650,11 +656,12 @@ def main():
         train_transform = A.Compose([A.NoOp()])
         
         val_transform = A.Compose([A.NoOp()])
-        
+
         # Create datasets
         train_dataset = MapillaryInstanceDataset(
             args.dataset_name,
             image_processor,
+            version='v2.0',
             split='training',
             transforms=train_transform,
         )
@@ -665,8 +672,8 @@ def main():
             val_dataset = MapillaryInstanceDataset(
                 args.dataset_name,
                 image_processor,
-                "validation",
-                split=image_processor,
+                version='v2.0',
+                split="validation",
                 transforms=val_transform,
             )
         except FileNotFoundError:
@@ -692,13 +699,22 @@ def main():
         
         id2label = {v: k for k, v in label2id.items()}
         
-        # Create complete DINOv3-Mask2Former model
-        model = create_mask2former_dinov3_model(
+
+        model_instance = Mask2Former_Dinov3()
+
+        model = model_instance.create_mask2former_dinov3_model(
             label2id=label2id,
             id2label=id2label,
             freeze_backbone=True,
             hub_token=args.hub_token,
         )
+        # # Create complete DINOv3-Mask2Former model
+        # model = create_mask2former_dinov3_model(
+        #     label2id=label2id,
+        #     id2label=id2label,
+        #     freeze_backbone=True,
+        #     hub_token=args.hub_token,
+        # )
         
     else:
         # Original HuggingFace dataset loading code
@@ -714,13 +730,20 @@ def main():
         id2label = {v: k for k, v in label2id.items()}
         
         # Create complete DINOv3-Mask2Former model
-        model = create_mask2former_dinov3_model(
+        # model = create_mask2former_dinov3_model(
+        #     label2id=label2id,
+        #     id2label=id2label,
+        #     freeze_backbone=True,
+        #     hub_token=args.hub_token,
+        # )
+        model_instance = Mask2Former_Dinov3()
+
+        model = model_instance.create_mask2former_dinov3_model(
             label2id=label2id,
             id2label=id2label,
             freeze_backbone=True,
             hub_token=args.hub_token,
         )
-        
         # Use image processor from model's mask2former_model_name
         image_processor = AutoImageProcessor.from_pretrained(
             image_processor_model,

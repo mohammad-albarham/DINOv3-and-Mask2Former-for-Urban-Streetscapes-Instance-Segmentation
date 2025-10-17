@@ -34,3 +34,6 @@ settings.json
 *.safetensors
 *.lock
 *.json
+*.jpeg
+*.jpg
+*ttf
