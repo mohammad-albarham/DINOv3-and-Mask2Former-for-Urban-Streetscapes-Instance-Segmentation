@@ -306,7 +306,7 @@ def inference_and_visualize(model, image_processor, image_path, save_path=None, 
         # (same as original code)
         draw = ImageDraw.Draw(image)
         try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24)
+            font= get_font(30)
         except OSError:
             font = ImageFont.load_default()
         
