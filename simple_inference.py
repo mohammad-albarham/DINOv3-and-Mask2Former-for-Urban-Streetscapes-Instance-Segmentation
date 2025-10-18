@@ -401,7 +401,7 @@ def process_directory(model, image_processor, input_dir, output_dir, threshold=0
 def main():
     parser = argparse.ArgumentParser(description="Simple Mask2Former Inference")
     parser.add_argument("--model_path", "-m", help="Path to model", 
-                        default="//Users/pain/Desktop/Chalmers_University_of_Technlogy/Courses/third_semster/SP5/SSY340/Project/Test_Dinov3/output/dinov3-smallplus-mask2former-1e4-unfreeze-1000_samples/epoch_29")
+                        default="/Users/pain/Desktop/Chalmers_University_of_Technlogy/Courses/third_semster/SP5/SSY340/Project/Test_Dinov3/output/dinov3-smallplus-mask2former-1e4-unfreeze-1000_samples/epoch_99")
     parser.add_argument("--image_path", "-i", help="Path to single image",
                         default="/Users/pain/Desktop/Chalmers_University_of_Technlogy/Courses/third_semster/SP5/SSY340/Project/Test_Dinov3/mapillary_dataset/training/images/__IoBfs3I6vB5ND-vqXK1A.jpg")
     parser.add_argument("--input_dir", "-d", help="Input directory (for batch processing)", 
