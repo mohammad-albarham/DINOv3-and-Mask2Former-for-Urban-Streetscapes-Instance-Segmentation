@@ -88,26 +88,10 @@ class DinoV3WithAdapterBackbone(nn.Module):
         # Return features with proper naming for Mask2Former
         return {name: feat for name, feat in zip(self.out_features, adapted_features)}
 
+from huggingface_hub.utils._typing import is_jsonable
 
-class Mask2Former_Dinov3(
-    nn.Module,
-    PyTorchModelHubMixin,
-    library_name="Mask2Former_Dinov3",
-    tags=["Mask2Former", "Dino_v3"],
-):
+class Mask2Former_Dinov3(nn.Module, PyTorchModelHubMixin):
     def __init__(
-        self,
-    ):
-        
-        super().__init__()
-
-
-        self.config = None
-
-        self.inner_model = None
-
-
-    def create_mask2former_dinov3_model(
         self,
         label2id: Dict[str, int],
         id2label: Dict[int, str],
@@ -115,34 +99,22 @@ class Mask2Former_Dinov3(
         expected_channels: List[int] = [96, 192, 384, 768],
         freeze_backbone: bool = True,
         hub_token: str = None,
-    ) -> AutoModelForUniversalSegmentation:
+        # mask2former_model_name: str = "facebook/mask2former-swin-small-coco-instance"
+    ):
+        super().__init__()
 
-    
-        """
-        Create a complete DINOv3-Mask2Former model with custom backbone replacement.
-        Args:
-            label2id: Dictionary mapping label names to IDs
-            id2label: Dictionary mapping IDs to label names
-            dinov3_model_name: HuggingFace model name for DINOv3
-            expected_channels: List of output channels for each stage
-            freeze_backbone: Whether to freeze DINOv3 backbone weights
-            hub_token: HuggingFace Hub token if needed
+        print(f"is_jsonable label2id: {is_jsonable(label2id)}")
 
-        Returns:
-            Complete DINOv3-Mask2Former model ready for training/inference
-        """
-        # Fixed Mask2Former base model
+        self.label2id = label2id
+        self.id2label = id2label
+        self.dinov3_model_name = dinov3_model_name
+        self.expected_channels = expected_channels
+        self.freeze_backbone = freeze_backbone
+        self.hub_token = hub_token
+        # self.mask2former_model_name = mask2former_model_name
+
         mask2former_model_name = "facebook/mask2former-swin-small-coco-instance"
-
-        logger.info(f"Creating DINOv3-Mask2Former model...")
-        logger.info(f"  - Mask2Former base: {mask2former_model_name}")
-        # logger.info(f"  - DINOv3 backbone: {dinov3_model_name}")
-        # logger.info(f"  - Expected channels: {expected_channels}")
-        logger.info(f"  - Freeze backbone: {freeze_backbone}")
-
-        # TODO: The model here loaded into the cpu, check it!
-        # TODO: Why we use AutoModelForUniversalSegmentation instead of AutoModelForInstanceSegmentation
-        # 1. Load the base Mask2Former model
+        # Build the Mask2Former model
         model = AutoModelForUniversalSegmentation.from_pretrained(
             mask2former_model_name,
             label2id=label2id,
@@ -150,65 +122,149 @@ class Mask2Former_Dinov3(
             ignore_mismatched_sizes=True,
             token=hub_token,
         )
-
-        # 2. Create custom DINOv3 backbone with adapter
         custom_backbone = DinoV3WithAdapterBackbone(
             dinov3_model_name, expected_channels
         )
-
-        # 3. Replace the backbone
         model.model.backbone = custom_backbone
-
-        # 4. Freeze DINOv3 weights if requested
         if freeze_backbone:
             for param in model.model.backbone.model.parameters():
                 param.requires_grad = False
-            logger.info("DINOv3 backbone weights frozen.")
-        else:
-            logger.info("DINOv3 backbone weights remain trainable.")
 
-        logger.info("Successfully created DINOv3-Mask2Former model.")
-
-        # 5. update the model configuration as well:
-
-        # model.config.backbone = "dinov3"
-        # model.config.model_type = "mask2former-with-dinov3"
-        # Optionally, add more info about your adapter design, layer indices, etc.
-
-        # Download the config automatically from Hugging Face
+        # Attach configs
         dino_config = AutoConfig.from_pretrained(dinov3_model_name)
-
-        mask2former_model_name_config = AutoConfig.from_pretrained(mask2former_model_name)
-
-        mask2former_model_name_config.model_type = "mask2former-with-dinov3"
-
-        # Now you can inspect, modify, and save it:
-        print(f"print Dino model config: {dino_config}")
-
-        # To save the config locally:
-        # dino_config.save_pretrained("Dino_v3.json")
-
         dino_config.architectures = ["DinoV3WithAdapterBackbone"]
-
-        # Now you can inspect, modify, and save it:
-        print(f"print Dino model config with custom config: {dino_config}")
-
-        # model.config.backbone_config = dino_config
-
+        mask2former_model_name_config = AutoConfig.from_pretrained(mask2former_model_name)
+        mask2former_model_name_config.model_type = "mask2former-with-dinov3"
         mask2former_model_name_config.backbone_config = dino_config
-
-        
-        # self.dino_config_dict = dino_config_dict
-
-        # self.mask2former_config_dict = model.config
-        
         model.config = mask2former_model_name_config
 
         self.inner_model = model
+        self.config = model.config  # For HF compatibility
 
-        self.config = model.config
+    def forward(self, *args, **kwargs):
+        return self.inner_model(*args, **kwargs)
 
-        return self.inner_model
+
+# class Mask2Former_Dinov3(
+#     nn.Module,
+#     PyTorchModelHubMixin,
+#     library_name="Mask2Former_Dinov3",
+#     tags=["Mask2Former", "Dino_v3"],
+# ):
+#     def __init__(
+#         self,
+#     ):
+        
+#         super().__init__()
+
+
+#         self.config = None
+
+#         self.inner_model = None
+
+
+#     def create_mask2former_dinov3_model(
+#         self,
+#         label2id: Dict[str, int],
+#         id2label: Dict[int, str],
+#         dinov3_model_name: str = "facebook/dinov3-vits16plus-pretrain-lvd1689m",
+#         expected_channels: List[int] = [96, 192, 384, 768],
+#         freeze_backbone: bool = True,
+#         hub_token: str = None,
+#     ) -> AutoModelForUniversalSegmentation:
+
+    
+#         """
+#         Create a complete DINOv3-Mask2Former model with custom backbone replacement.
+#         Args:
+#             label2id: Dictionary mapping label names to IDs
+#             id2label: Dictionary mapping IDs to label names
+#             dinov3_model_name: HuggingFace model name for DINOv3
+#             expected_channels: List of output channels for each stage
+#             freeze_backbone: Whether to freeze DINOv3 backbone weights
+#             hub_token: HuggingFace Hub token if needed
+
+#         Returns:
+#             Complete DINOv3-Mask2Former model ready for training/inference
+#         """
+#         # Fixed Mask2Former base model
+#         mask2former_model_name = "facebook/mask2former-swin-small-coco-instance"
+
+#         logger.info(f"Creating DINOv3-Mask2Former model...")
+#         logger.info(f"  - Mask2Former base: {mask2former_model_name}")
+#         # logger.info(f"  - DINOv3 backbone: {dinov3_model_name}")
+#         # logger.info(f"  - Expected channels: {expected_channels}")
+#         logger.info(f"  - Freeze backbone: {freeze_backbone}")
+
+#         # TODO: The model here loaded into the cpu, check it!
+#         # TODO: Why we use AutoModelForUniversalSegmentation instead of AutoModelForInstanceSegmentation
+#         # 1. Load the base Mask2Former model
+#         model = AutoModelForUniversalSegmentation.from_pretrained(
+#             mask2former_model_name,
+#             label2id=label2id,
+#             id2label=id2label,
+#             ignore_mismatched_sizes=True,
+#             token=hub_token,
+#         )
+
+#         # 2. Create custom DINOv3 backbone with adapter
+#         custom_backbone = DinoV3WithAdapterBackbone(
+#             dinov3_model_name, expected_channels
+#         )
+
+#         # 3. Replace the backbone
+#         model.model.backbone = custom_backbone
+
+#         # 4. Freeze DINOv3 weights if requested
+#         if freeze_backbone:
+#             for param in model.model.backbone.model.parameters():
+#                 param.requires_grad = False
+#             logger.info("DINOv3 backbone weights frozen.")
+#         else:
+#             logger.info("DINOv3 backbone weights remain trainable.")
+
+#         logger.info("Successfully created DINOv3-Mask2Former model.")
+
+#         # 5. update the model configuration as well:
+
+#         # model.config.backbone = "dinov3"
+#         # model.config.model_type = "mask2former-with-dinov3"
+#         # Optionally, add more info about your adapter design, layer indices, etc.
+
+#         # Download the config automatically from Hugging Face
+#         dino_config = AutoConfig.from_pretrained(dinov3_model_name)
+
+#         mask2former_model_name_config = AutoConfig.from_pretrained(mask2former_model_name)
+
+#         mask2former_model_name_config.model_type = "mask2former-with-dinov3"
+
+#         # Now you can inspect, modify, and save it:
+#         print(f"print Dino model config: {dino_config}")
+
+#         # To save the config locally:
+#         # dino_config.save_pretrained("Dino_v3.json")
+
+#         dino_config.architectures = ["DinoV3WithAdapterBackbone"]
+
+#         # Now you can inspect, modify, and save it:
+#         print(f"print Dino model config with custom config: {dino_config}")
+
+#         # model.config.backbone_config = dino_config
+
+#         mask2former_model_name_config.backbone_config = dino_config
+
+        
+#         # self.dino_config_dict = dino_config_dict
+
+#         # self.mask2former_config_dict = model.config
+        
+#         model.config = mask2former_model_name_config
+
+#         self.inner_model = model
+
+#         self.config = model.config
+
+#         return self.inner_model
     
     # def forward(self, *args, **kwargs):
     #     return self.inner_model(*args, **kwargs)

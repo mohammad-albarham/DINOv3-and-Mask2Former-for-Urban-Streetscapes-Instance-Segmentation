@@ -18,6 +18,7 @@ mapillary_dataset/*
 mapillary_dataset copy/*
 global-streetscapes/*
 wandb/*
+output/*
 
 # logs 
 
@@ -37,3 +38,4 @@ settings.json
 *.jpeg
 *.jpg
 *ttf
+image_files.txt

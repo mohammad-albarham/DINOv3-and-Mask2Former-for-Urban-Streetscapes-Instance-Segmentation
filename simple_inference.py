@@ -135,16 +135,46 @@ def load_model(model_path):
     # model = AutoModelForUniversalSegmentation.from_pretrained(model_path)
 
 
-    model_instance = Mask2Former_Dinov3()
+    # model_instance = Mask2Former_Dinov3()
 
-    Mask2Former_Dinov3_config = AutoConfig.from_pretrained(model_path)
+    # Mask2Former_Dinov3_config = AutoConfig.from_pretrained(model_path)
 
-    model = model_instance.create_mask2former_dinov3_model(
-        label2id=Mask2Former_Dinov3_config.label2id,
-        id2label=Mask2Former_Dinov3_config.id2label,
-        freeze_backbone=True,
-        hub_token=None,
-    )
+    # model = model_instance.create_mask2former_dinov3_model(
+    #     label2id=Mask2Former_Dinov3_config.label2id,
+    #     id2label=Mask2Former_Dinov3_config.id2label,
+    #     freeze_backbone=True,
+    #     hub_token=None,
+    # )
+
+    # model = Mask2Former_Dinov3.from_pretrained(model_path)
+    
+    from safetensors.torch import load_file
+
+    state_dict = load_file("/Users/pain/Desktop/Chalmers_University_of_Technlogy/Courses/third_semster/SP5/SSY340/Project/Test_Dinov3/output/dinov3-smallplus-mask2former-1e4-unfreeze-1000_samples/best_model/model.safetensors")
+
+    from rich import print as rprint
+    # rprint(f"state_dict: {state_dict.inner_model.model.}")
+    from transformers import AutoConfig
+
+    # After model initialization
+    config = AutoConfig.from_pretrained("/Users/pain/Desktop/Chalmers_University_of_Technlogy/Courses/third_semster/SP5/SSY340/Project/Test_Dinov3/output/dinov3-smallplus-mask2former-1e4-unfreeze-1000_samples/best_model/")
+
+    # # Assume you have instantiated your model with the correct class mappings
+    # model = Mask2Former_Dinov3(
+    # label2id=config.label2id,
+    # id2label=config.id2label,
+    # freeze_backbone=True,
+    # hub_token=config.hub_token)
+    
+    # model.load_state_dict(state_dict, strict=False)
+
+    model = Mask2Former_Dinov3.from_pretrained(model_path)
+    # model.load_state_dict(state_dict, strict=False)
+
+    
+    rprint(f"linear predictor weights check: {model.inner_model.class_predictor.weight[0][:5]}")
+
+
     model.eval()
     
     if torch.cuda.is_available():
@@ -157,7 +187,7 @@ def load_model(model_path):
     
     return model, image_processor
 
-def inference_and_visualize(model, image_processor, image_path, save_path=None, threshold=0.5, CLASS_NAMES=None):
+def inference_and_visualize(model, image_processor, image_path, save_path='None', threshold=0.5, CLASS_NAMES=None):
     """Inference and visualization (modified version)"""
     # Load image
     image = Image.open(image_path).convert('RGB')
@@ -371,14 +401,16 @@ def process_directory(model, image_processor, input_dir, output_dir, threshold=0
 def main():
     parser = argparse.ArgumentParser(description="Simple Mask2Former Inference")
     parser.add_argument("--model_path", "-m", help="Path to model", 
-                        default="/Users/pain/Desktop/Chalmers_University_of_Technlogy/Courses/third_semster/SP5/SSY340/Project/Test_Dinov3/output/dinov3-smallplus-mask2former-1e4-unfreeze/best_model")
+                        default="//Users/pain/Desktop/Chalmers_University_of_Technlogy/Courses/third_semster/SP5/SSY340/Project/Test_Dinov3/output/dinov3-smallplus-mask2former-1e4-unfreeze-1000_samples/epoch_29")
     parser.add_argument("--image_path", "-i", help="Path to single image",
                         default="/Users/pain/Desktop/Chalmers_University_of_Technlogy/Courses/third_semster/SP5/SSY340/Project/Test_Dinov3/mapillary_dataset/training/images/__IoBfs3I6vB5ND-vqXK1A.jpg")
     parser.add_argument("--input_dir", "-d", help="Input directory (for batch processing)", 
-                        default="/Users/pain/Desktop/Chalmers_University_of_Technlogy/Courses/third_semster/SP5/SSY340/Project/Test_Dinov3/test_inference")
+                        default="/Users/pain/Desktop/Chalmers_University_of_Technlogy/Courses/third_semster/SP5/SSY340/Project/Test_Dinov3/test_inference"
+                        )
     parser.add_argument("--output_dir", "-od", help="Output directory (for batch processing)", 
                         default="/Users/pain/Desktop/Chalmers_University_of_Technlogy/Courses/third_semster/SP5/SSY340/Project/Test_Dinov3/results_temp")
-    parser.add_argument("--output", "-o", help="Output path for single image result")
+    parser.add_argument("--output", "-o", help="Output path for single image result", 
+                        default='output.png')
     parser.add_argument("--threshold", "-t", type=float, default=0.2, help="Detection threshold (default: 0.5)")
     parser.add_argument("--batch", "-b", action="store_true", help="Batch processing mode")
     parser.add_argument("--recursive", "-r", action="store_true", help="Process subdirectories recursively")
@@ -394,6 +426,7 @@ def main():
 
     # After model initialization
     config = AutoConfig.from_pretrained(args.model_path)
+
     CLASS_NAMES = {int(k): v for k, v in config.id2label.items()}
 
 

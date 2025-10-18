@@ -168,10 +168,25 @@ class MapillaryInstanceDataset(Dataset):
         self.image_files = sorted(glob.glob(os.path.join(images_dir, '*.jpg')))
         self.image_ids = [os.path.splitext(os.path.basename(f))[0] for f in self.image_files]
 
-        N_train = 1
-        N_val = 1
-        self.image_ids = self.image_ids[:N_train]  # Only use first N
-        self.image_files = self.image_files[:N_val]
+
+        if split == "training":
+
+            N_train = 2
+           
+            self.image_ids = self.image_ids[:N_train]  # Only use first N
+            self.image_files = self.image_files[:N_train]
+            print(f"self.image_files: {self.image_files}")
+            with open("image_files.txt", "w") as f:
+                for file_path in self.image_files:
+                    f.write(file_path + "\n")
+
+            print("Saved image file list to image_files.txt")
+
+        else:
+            N_val = 2
+
+            self.image_ids = self.image_ids[:N_val]  # Only use first N
+            self.image_files = self.image_files[:N_val]
 
         print(f"Loaded {len(self.image_ids)} images from {split} split")
         print(f"Number of thing classes (with instances): {len(self.thing_classes)}")
@@ -607,7 +622,8 @@ def parse_args():
 
 def main():
     args = parse_args()
-    
+
+
     # Load model creation function and mask2former model name from config
     create_mask2former_dinov3_model, image_processor_model = load_model_from_config(args.model)
     logger.info(f"Using image processor: {image_processor_model}")
@@ -630,6 +646,7 @@ def main():
 
     if args.push_to_hub:
         api = HfApi()
+
 
     # ------------------------------------------------------------------------------------------------
     # Load dataset, prepare splits - MODIFIED FOR MAPILLARY DATASET
@@ -700,14 +717,24 @@ def main():
         id2label = {v: k for k, v in label2id.items()}
         
 
-        model_instance = Mask2Former_Dinov3()
+        # model_instance = Mask2Former_Dinov3()
 
-        model = model_instance.create_mask2former_dinov3_model(
+        # model = model_instance.create_mask2former_dinov3_model(
+        #     label2id=label2id,
+        #     id2label=id2label,
+        #     freeze_backbone=True,
+        #     hub_token=args.hub_token,
+        # )
+
+
+        model = Mask2Former_Dinov3(
             label2id=label2id,
             id2label=id2label,
             freeze_backbone=True,
-            hub_token=args.hub_token,
-        )
+            hub_token=args.hub_token)
+
+        print("Loaded label2id count:", len(model.label2id))
+
         # # Create complete DINOv3-Mask2Former model
         # model = create_mask2former_dinov3_model(
         #     label2id=label2id,
@@ -715,7 +742,11 @@ def main():
         #     freeze_backbone=True,
         #     hub_token=args.hub_token,
         # )
-        
+
+        from rich import print as rprint
+
+        rprint(f"linear predictor weights check: {model.inner_model.class_predictor.weight[0][:5]}")
+
     else:
         # Original HuggingFace dataset loading code
         logger.info(f"Loading dataset from HuggingFace Hub: {args.dataset_name}")
@@ -730,20 +761,30 @@ def main():
         id2label = {v: k for k, v in label2id.items()}
         
         # Create complete DINOv3-Mask2Former model
+
         # model = create_mask2former_dinov3_model(
         #     label2id=label2id,
         #     id2label=id2label,
         #     freeze_backbone=True,
         #     hub_token=args.hub_token,
         # )
-        model_instance = Mask2Former_Dinov3()
 
-        model = model_instance.create_mask2former_dinov3_model(
+        # model_instance = Mask2Former_Dinov3()
+
+        # model = model_instance.create_mask2former_dinov3_model(
+        #     label2id=label2id,
+        #     id2label=id2label,
+        #     freeze_backbone=True,
+        #     hub_token=args.hub_token,
+        # )
+        model = Mask2Former_Dinov3(
             label2id=label2id,
             id2label=id2label,
             freeze_backbone=True,
-            hub_token=args.hub_token,
-        )
+            hub_token=args.hub_token)
+        
+        print("Loaded label2id count:", len(model.label2id))
+        
         # Use image processor from model's mask2former_model_name
         image_processor = AutoImageProcessor.from_pretrained(
             image_processor_model,
@@ -847,6 +888,66 @@ def main():
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
     # ------------------------------------------------------------------------------------------------
+    # Adding wandb to track the losses ### 
+    # ------------------------------------------------------------------------------------------------
+
+    import wandb
+
+    wandb_config = {
+        "learning_rate": args.learning_rate,
+        "architecture": "Mask2Former (DINOv3 backbone)",  
+        "backbone": args.model,                           
+        "image_height": args.image_height,
+        "image_width": args.image_width,
+        "dataset": args.dataset_name,                      # hub name or local path
+        "epochs": args.num_train_epochs,
+        "batch_size_per_device": args.per_device_train_batch_size,
+        "eval_batch_size": args.per_device_eval_batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "num_train_steps": args.max_train_steps,
+        "lr_scheduler_type": str(args.lr_scheduler_type),
+        "adam_beta1": args.adam_beta1,
+        "adam_beta2": args.adam_beta2,
+        "adam_epsilon": args.adam_epsilon,
+        "num_warmup_steps": args.num_warmup_steps,
+        "num_workers": args.dataloader_num_workers,
+        "seed": args.seed,
+        "output_dir": args.output_dir,
+        "optimizer": type(optimizer).__name__,             
+        "device": str(accelerator.device),               
+        "checkpointing_steps": args.checkpointing_steps,
+        "resume_from_checkpoint": args.resume_from_checkpoint,
+        "do_reduce_labels": args.do_reduce_labels,
+        "push_to_hub": args.push_to_hub,
+        "hub_model_id": args.hub_model_id,
+        "cache_dir": args.cache_dir,
+    }
+
+    run_name = (
+        f"{os.path.basename(args.model)}-"
+        f"Mask2Former-E{wandb_config['epochs']}-BS{wandb_config['batch_size_per_device']}-"
+        f"LR{wandb_config['learning_rate']}"
+    )
+
+    run = wandb.init(
+        entity="albarham-chalmers",
+        project="Instance-segmentation-project",
+        name=run_name,
+        config=wandb_config,
+        tags=[
+            "segmentation",
+            "ViT",
+            "Mask2Former",
+            wandb_config["dataset"],
+            "GPU",
+            "safetensors",
+        ],
+        save_code=True,
+    )
+
+
+
+    # ------------------------------------------------------------------------------------------------
     # Run training with evaluation on each epoch
     # ------------------------------------------------------------------------------------------------
 
@@ -923,6 +1024,9 @@ def main():
                 if "original_sizes" in batch:
                     batch.pop("original_sizes")
                 # ================== FIX END ====================
+
+                #TODO: Chjeck if the batch is empty/targets maybe? Quick run on that 
+
                 outputs = model(**batch)
                 loss = outputs.loss
                 accelerator.backward(loss)
@@ -930,10 +1034,15 @@ def main():
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
+                # Log the loss value to wandb
+                wandb.log({"train_loss": loss.item()}, step=completed_steps)
+                
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 completed_steps += 1
+
+            rprint(f"linear predictor weights check: {model.inner_model.class_predictor.weight[0][:5]}")
 
             if isinstance(checkpointing_steps, int):
                 if completed_steps % checkpointing_steps == 0 and accelerator.sync_gradients:
@@ -962,6 +1071,9 @@ def main():
                         accelerator.wait_for_everyone()
                         unwrapped_model = accelerator.unwrap_model(model)
                         
+                        rprint(f"linear predictor weights check: {model.inner_model.class_predictor.weight[0][:5]}")
+
+
                         if accelerator.is_main_process:
                             # 추론용 모델 저장
                             os.makedirs(model_checkpoint_dir, exist_ok=True)
