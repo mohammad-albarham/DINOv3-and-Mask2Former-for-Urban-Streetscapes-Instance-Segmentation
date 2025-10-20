@@ -73,6 +73,7 @@ pretty.install()
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.56.0.dev0")
 
+from rich import print as rprint
 
 def load_model_from_config(model_path: str):
     """
@@ -171,7 +172,7 @@ class MapillaryInstanceDataset(Dataset):
 
         if split == "training":
 
-            N_train = 2
+            N_train = 1
            
             self.image_ids = self.image_ids[:N_train]  # Only use first N
             self.image_files = self.image_files[:N_train]
@@ -183,10 +184,15 @@ class MapillaryInstanceDataset(Dataset):
             print("Saved image file list to image_files.txt")
 
         else:
-            N_val = 2
+            N_val = 1
 
             self.image_ids = self.image_ids[:N_val]  # Only use first N
             self.image_files = self.image_files[:N_val]
+
+            print(f"self.image_files: {self.image_files}")
+            with open("image_files_valid.txt", "w") as f:
+                for file_path in self.image_files:
+                    f.write(file_path + "\n")
 
         print(f"Loaded {len(self.image_ids)} images from {split} split")
         print(f"Number of thing classes (with instances): {len(self.thing_classes)}")
@@ -273,6 +279,7 @@ class MapillaryInstanceDataset(Dataset):
         return len(self.thing_classes) + 1  # +1 for background
 
 
+
 def augment_and_transform_batch(
     examples: Mapping[str, Any], transform: A.Compose, image_processor: AutoImageProcessor
 ) -> BatchFeature:
@@ -348,9 +355,14 @@ def evaluation_loop(model, image_processor, accelerator: Accelerator, dataloader
     for inputs in tqdm(dataloader, total=len(dataloader), disable=not accelerator.is_local_main_process):
         original_sizes = inputs.pop("original_sizes", None)
         
-        with torch.no_grad():
-            outputs = model(**inputs)
-        
+        try:
+            
+            with torch.no_grad():
+                outputs = model(**inputs)
+        except Exception as e:
+            rprint(f"An error occurred: {e}")
+            continue
+            
         # Get target sizes for current batch
         if original_sizes is not None:
             current_target_sizes = original_sizes
@@ -717,16 +729,6 @@ def main():
         id2label = {v: k for k, v in label2id.items()}
         
 
-        # model_instance = Mask2Former_Dinov3()
-
-        # model = model_instance.create_mask2former_dinov3_model(
-        #     label2id=label2id,
-        #     id2label=id2label,
-        #     freeze_backbone=True,
-        #     hub_token=args.hub_token,
-        # )
-
-
         model = Mask2Former_Dinov3(
             label2id=label2id,
             id2label=id2label,
@@ -735,17 +737,9 @@ def main():
 
         print("Loaded label2id count:", len(model.label2id))
 
-        # # Create complete DINOv3-Mask2Former model
-        # model = create_mask2former_dinov3_model(
-        #     label2id=label2id,
-        #     id2label=id2label,
-        #     freeze_backbone=True,
-        #     hub_token=args.hub_token,
-        # )
-
         from rich import print as rprint
 
-        rprint(f"linear predictor weights check: {model.inner_model.class_predictor.weight[0][:5]}")
+        # rprint(f"linear predictor weights check: {model.inner_model.class_predictor.weight[0][:5]}")
 
     else:
         # Original HuggingFace dataset loading code
@@ -760,23 +754,6 @@ def main():
         
         id2label = {v: k for k, v in label2id.items()}
         
-        # Create complete DINOv3-Mask2Former model
-
-        # model = create_mask2former_dinov3_model(
-        #     label2id=label2id,
-        #     id2label=id2label,
-        #     freeze_backbone=True,
-        #     hub_token=args.hub_token,
-        # )
-
-        # model_instance = Mask2Former_Dinov3()
-
-        # model = model_instance.create_mask2former_dinov3_model(
-        #     label2id=label2id,
-        #     id2label=id2label,
-        #     freeze_backbone=True,
-        #     hub_token=args.hub_token,
-        # )
         model = Mask2Former_Dinov3(
             label2id=label2id,
             id2label=id2label,
@@ -997,7 +974,10 @@ def main():
             completed_steps = starting_epoch * num_update_steps_per_epoch
         else:
             # need to multiply `gradient_accumulation_steps` to reflect real steps
-            resume_step = int(training_difference.replace("step_", "")) * args.gradient_accumulation_steps
+            rprint(f"training_difference: {training_difference}")
+            resume_step_str = training_difference.replace("step_", "").removesuffix("_state")
+            resume_step = int(resume_step_str) * args.gradient_accumulation_steps
+            # resume_step = int(training_difference.replace("step_", "")) * args.gradient_accumulation_steps
             starting_epoch = resume_step // len(train_dataloader)
             completed_steps = resume_step // args.gradient_accumulation_steps
             resume_step -= starting_epoch * len(train_dataloader)
@@ -1024,10 +1004,12 @@ def main():
                 if "original_sizes" in batch:
                     batch.pop("original_sizes")
                 # ================== FIX END ====================
-
-                #TODO: Chjeck if the batch is empty/targets maybe? Quick run on that 
-
-                outputs = model(**batch)
+                
+                try:
+                    outputs = model(**batch)
+                except Exception as e:
+                    rprint(f"An error occurred: {e}")
+                    continue
                 loss = outputs.loss
                 accelerator.backward(loss)
                 optimizer.step()
@@ -1042,7 +1024,7 @@ def main():
                 progress_bar.update(1)
                 completed_steps += 1
 
-            rprint(f"linear predictor weights check: {model.inner_model.class_predictor.weight[0][:5]}")
+            # rprint(f"linear predictor weights check: {model.inner_model.class_predictor.weight[0][:5]}")
 
             if isinstance(checkpointing_steps, int):
                 if completed_steps % checkpointing_steps == 0 and accelerator.sync_gradients:
@@ -1054,9 +1036,18 @@ def main():
                         model.eval()
                         
                         # 2. 현재 스텝의 성능 메트릭 계산
-                        metrics = evaluation_loop(model, image_processor, accelerator, valid_dataloader, id2label)
-                        logger.info(f"Metrics at step {completed_steps}: {metrics}")
+                        try:
+                            metrics = evaluation_loop(model, image_processor, accelerator, valid_dataloader, id2label)
+                            # At end of epoch evaluation, after metrics = evaluation_loop(...)
+                            wandb.log({f"steps_eval_{k}": (v.item() if isinstance(v, torch.Tensor) and v.numel()==1 else v.tolist() if isinstance(v, torch.Tensor) else v)
+                                for k, v in metrics.items()}, step=completed_steps)
+
+                            logger.info(f"Metrics at step {completed_steps}: {metrics}")
                         
+                        except Exception as e:
+                            rprint(f"An error occurred: {e}")
+                            continue
+
                         # 3. 다시 train 모드로 전환하여 학습 계속
                         model.train()
 
@@ -1071,7 +1062,7 @@ def main():
                         accelerator.wait_for_everyone()
                         unwrapped_model = accelerator.unwrap_model(model)
                         
-                        rprint(f"linear predictor weights check: {model.inner_model.class_predictor.weight[0][:5]}")
+                        # rprint(f"linear predictor weights check: {model.inner_model.class_predictor.weight[0][:5]}")
 
 
                         if accelerator.is_main_process:
@@ -1118,6 +1109,10 @@ def main():
 
         logger.info("***** Running evaluation *****")
         metrics = evaluation_loop(model, image_processor, accelerator, valid_dataloader, id2label)
+
+        wandb.log({f"epoch_eval_{k}": (v.item() if isinstance(v, torch.Tensor) and v.numel()==1 else v.tolist() if isinstance(v, torch.Tensor) else v)
+                    for k, v in metrics.items()}, step=completed_steps)
+
 
         logger.info(f"epoch {epoch}: {metrics}")
 
@@ -1218,6 +1213,9 @@ def main():
     logger.info("***** Running evaluation on test dataset *****")
     metrics = evaluation_loop(model, image_processor, accelerator, valid_dataloader, id2label)
     
+    # wandb.log({f"final_eval_{k}": (v.item() if isinstance(v, torch.Tensor) and v.numel()==1 else v.tolist() if isinstance(v, torch.Tensor) else v)
+    #         for k, v in metrics.items()})
+
     processed_metrics = {}
     for key, value in metrics.items():
         if isinstance(value, torch.Tensor):
@@ -1250,6 +1248,20 @@ def main():
             with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
                 json.dump(final_results, f, indent=2)
             
+            # Log all test and summary metrics to wandb dashboard
+            if run is not None:  # Only if wandb is initialized
+                # Log all final test metrics. To avoid nested dict for training_summary, flatten them.
+                wandb.log({
+                    **{f"final_test_{k}": v for k, v in processed_metrics.items()},
+                    # Summarize best metric info
+                    "final_best_epoch": best_epoch,
+                    "final_best_metric": best_metric,
+                    "final_best_metric_name": final_results["training_summary"]["best_metric_name"],
+                    # Optionally, flatten best_epoch_metrics
+                    **{f"final_best_epoch_{k}": v for k, v in final_results["training_summary"].get("best_epoch_metrics", {}).items()}
+                }, step=args.num_train_epochs)
+
+
             # Best epoch 요약 로그
             if best_epoch >= 0:
                 logger.info(f"🏆 훈련 완료! BEST EPOCH: {best_epoch}, 최고 성능: {best_metric:.4f}")
@@ -1268,6 +1280,7 @@ def main():
                     token=args.hub_token,
                     ignore_patterns=["epoch_*"],
                 )
+                
 
     accelerator.wait_for_everyone()
 

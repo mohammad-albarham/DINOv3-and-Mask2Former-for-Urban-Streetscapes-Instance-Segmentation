@@ -19,7 +19,7 @@ mapillary_dataset copy/*
 global-streetscapes/*
 wandb/*
 output/*
-
+output_init/*
 # logs 
 
 *.log

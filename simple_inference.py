@@ -401,7 +401,7 @@ def process_directory(model, image_processor, input_dir, output_dir, threshold=0
 def main():
     parser = argparse.ArgumentParser(description="Simple Mask2Former Inference")
     parser.add_argument("--model_path", "-m", help="Path to model", 
-                        default="/Users/pain/Desktop/Chalmers_University_of_Technlogy/Courses/third_semster/SP5/SSY340/Project/Test_Dinov3/output_init/dinov3-smallplus-mask2former-1e4-unfreeze-1000_samples/epoch_99")
+                        default="/Users/pain/Desktop/Chalmers_University_of_Technlogy/Courses/third_semster/SP5/SSY340/Project/Test_Dinov3/output_new_5000/dinov3-smallplus-mask2former-1e4-unfreeze-1000_samples/step_6400_model")
     parser.add_argument("--image_path", "-i", help="Path to single image",
                         default="/Users/pain/Desktop/Chalmers_University_of_Technlogy/Courses/third_semster/SP5/SSY340/Project/Test_Dinov3/mapillary_dataset/training/images/__IoBfs3I6vB5ND-vqXK1A.jpg")
     parser.add_argument("--input_dir", "-d", help="Input directory (for batch processing)", 
@@ -411,7 +411,7 @@ def main():
                         default="/Users/pain/Desktop/Chalmers_University_of_Technlogy/Courses/third_semster/SP5/SSY340/Project/Test_Dinov3/results_temp")
     parser.add_argument("--output", "-o", help="Output path for single image result", 
                         default='output.png')
-    parser.add_argument("--threshold", "-t", type=float, default=0.2, help="Detection threshold (default: 0.5)")
+    parser.add_argument("--threshold", "-t", type=float, default=0.5, help="Detection threshold (default: 0.5)")
     parser.add_argument("--batch", "-b", action="store_true", help="Batch processing mode")
     parser.add_argument("--recursive", "-r", action="store_true", help="Process subdirectories recursively")
     

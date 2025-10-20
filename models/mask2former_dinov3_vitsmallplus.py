@@ -140,28 +140,28 @@ class Mask2Former_Dinov3(nn.Module, PyTorchModelHubMixin):
         model.config = mask2former_model_name_config
        
        # Edit Start here
-        rprint("Number of trainable parameters before freezing:",
-        sum(p.numel() for p in model.parameters() if p.requires_grad))
+        # rprint("Number of trainable parameters before freezing:",
+        # sum(p.numel() for p in model.parameters() if p.requires_grad))
 
-        # A trial to have a better performance of the model 
-        # by freeze everything except the adapter and the final linear layer
+        # # A trial to have a better performance of the model 
+        # # by freeze everything except the adapter and the final linear layer
 
-        # # Freeze DINOv3 backbone
-        # for param in model.model.backbone.parameters():
+        # # # Freeze DINOv3 backbone
+        # # for param in model.model.backbone.parameters():
+        # #     param.requires_grad = False
+
+        # # Freeze all parameters in the entire model
+        # for param in model.parameters():
         #     param.requires_grad = False
 
-        # Freeze all parameters in the entire model
-        for param in model.parameters():
-            param.requires_grad = False
+        # # Unfreeze Adapter
+        # for param in model.model.backbone.adapter.parameters():
+        #     param.requires_grad = True
 
-        # Unfreeze Adapter
-        for param in model.model.backbone.adapter.parameters():
-            param.requires_grad = True
-
-        # Unfreeze classification head (Mask2Former class predictor)
-        for param in model.class_predictor.parameters():
-            param.requires_grad = True
-        # # Edit Ends here
+        # # Unfreeze classification head (Mask2Former class predictor)
+        # for param in model.class_predictor.parameters():
+        #     param.requires_grad = True
+        # # # Edit Ends here
         self.inner_model = model
         self.config = model.config  # For HF compatibility
        
@@ -171,15 +171,14 @@ class Mask2Former_Dinov3(nn.Module, PyTorchModelHubMixin):
         rprint("Number of trainable parameters after freezing:",
         sum(p.numel() for p in self.inner_model.parameters() if p.requires_grad))
 
-        rprint("\nTrainable parameters (name):")
-        for name, param in self.inner_model.named_parameters():
-            if param.requires_grad:
-                rprint(name, param.shape)
+        # rprint("\nTrainable parameters (name):")
+        # for name, param in self.inner_model.named_parameters():
+        #     if param.requires_grad:
+        #         rprint(name, param.shape)
         # Edit Ends here
 
     def forward(self, *args, **kwargs):
         return self.inner_model(*args, **kwargs)
-
 
 
 def create_mask2former_dinov3_model(
