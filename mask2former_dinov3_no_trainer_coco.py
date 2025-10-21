@@ -43,6 +43,7 @@ from datasets import load_dataset
 from huggingface_hub import HfApi
 from torch.utils.data import DataLoader, Dataset
 from torchmetrics.detection.mean_ap import MeanAveragePrecision
+from torchmetrics.detection import IntersectionOverUnion
 from tqdm import tqdm
 from pycocotools.coco import COCO
 from PIL import Image
@@ -63,6 +64,9 @@ import importlib.util
 from models.mask2former_dinov3_vitsmallplus import Mask2Former_Dinov3
 
 import glob
+
+import torch.nn.functional as F
+
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +147,7 @@ class MapillaryInstanceDataset(Dataset):
         self.image_processor = image_processor
         self.version = version
         self.split = split
+        # self.split = 'validation'
         self.transforms = transforms
 
         # Load config file to get label information
@@ -172,9 +177,10 @@ class MapillaryInstanceDataset(Dataset):
 
         if split == "training":
 
-            N_train = 1
+            N_train = 6000
            
             self.image_ids = self.image_ids[:N_train]  # Only use first N
+            # self.image_ids = ['--BJs76vloEaiH-wppzWNA']
             self.image_files = self.image_files[:N_train]
             print(f"self.image_files: {self.image_files}")
             with open("image_files.txt", "w") as f:
@@ -184,9 +190,10 @@ class MapillaryInstanceDataset(Dataset):
             print("Saved image file list to image_files.txt")
 
         else:
-            N_val = 1
+            N_val = 500
 
             self.image_ids = self.image_ids[:N_val]  # Only use first N
+            # self.image_ids = ['--BJs76vloEaiH-wppzWNA']
             self.image_files = self.image_files[:N_val]
 
             print(f"self.image_files: {self.image_files}")
@@ -399,13 +406,84 @@ def evaluation_loop(model, image_processor, accelerator: Accelerator, dataloader
                 }
             post_processed_predictions.append(pred)
             
+            # Target (upsample mask to original size if needed)
+            target_masks = inputs["mask_labels"][idx].to(dtype=torch.bool)
+
+            if target_masks.shape[-2:] != tuple(target_size):
+                # Upsample all masks [N, H, W] to [N, target_H, target_W]
+                target_masks = F.interpolate(
+                    target_masks.float().unsqueeze(0), size=tuple(target_size), mode='nearest'
+                )[0].bool()
+
+
             # Target
             target = {
-                "masks": inputs["mask_labels"][idx].to(dtype=torch.bool),
+                "masks": target_masks,
                 "labels": inputs["class_labels"][idx],
             }
+
             post_processed_targets.append(target)
-        
+
+            # import matplotlib.pyplot as plt
+            # import numpy as np
+
+            # def plot_pred_target_masks(pred, target, index=0):
+            #     # pred['masks']: [num_pred, H, W] bool
+            #     # target['masks']: [num_target, H, W] bool
+
+            #     if pred['masks'].shape[0] == 0 or target['masks'].shape[0] == 0:
+            #         print("No masks to plot for this prediction/target.")
+            #         return
+
+            #     # For demonstration: overlay first predicted mask and first target mask
+            #     pred_mask = pred['masks'][0].cpu().numpy()
+            #     target_mask = target['masks'][0].cpu().numpy()
+                
+            #     # Optional: create a semi-transparent overlay for comparison
+            #     overlay = np.zeros((*pred_mask.shape, 3), dtype=np.float32)
+            #     overlay[..., 0] = pred_mask.astype(np.float32)  # Red for prediction
+            #     overlay[..., 1] = target_mask.astype(np.float32)  # Green for target
+            #     overlay[..., 2] = 0  # Blue channel empty
+
+            #     plt.figure(figsize=(8,8))
+            #     plt.imshow(overlay, alpha=0.7)
+            #     plt.title(f"Overlay: prediction (red), target (green)")
+            #     plt.axis('off')
+            #     plt.show()
+
+            # # In evaluation loop, after creating post_processed_predictions/targets:
+            # for idx, (pred, target) in enumerate(zip(post_processed_predictions, post_processed_targets)):
+            #     plot_pred_target_masks(pred, target, index=idx)
+            #     # Optional: break or limit the number plotted per batch for efficiency
+            #     if idx > 5: break
+
+
+        # import matplotlib.pyplot as plt
+        # import numpy as np
+        # for target in post_processed_targets:
+        #     # target["masks"]: [num_instances, H, W]
+        #     # If you produce a combined mask map per pixel (class ids)
+        #     target_mask_map = torch.zeros_like(target['masks'][0], dtype=torch.int64)
+        #     for mask, label in zip(target['masks'], target['labels']):
+        #         target_mask_map[mask] = label
+        #     # Now check for background
+        #     has_background = (target_mask_map == 0).any().item()
+        #     if has_background:
+        #         print("Background pixels detected in this mask.")
+
+        # combined_pred = np.sum(pred['masks'].cpu().numpy(), axis=0)
+        # combined_target = np.sum(target['masks'].cpu().numpy(), axis=0)
+        # overlay = np.zeros((*combined_pred.shape, 3), dtype=np.float32)
+        # overlay[..., 0] = (combined_pred > 0)  # Red = any pred mask pixel
+        # overlay[..., 1] = (combined_target > 0)  # Green = any target mask pixel
+
+        # plt.imshow(overlay, alpha=0.7)
+        # plt.title("All Predicted (Red) vs Target Masks (Green)")
+        # plt.show()
+
+        # rprint(f"post_processed_predictions: {post_processed_predictions}")
+        # rprint(f"post_processed_targets: {post_processed_targets}")
+
         # Update metric locally (no gathering)
         metric.update(post_processed_predictions, post_processed_targets)
 
@@ -605,6 +683,14 @@ def parse_args():
         help="If the training should continue from a checkpoint folder.",
     )
     
+    parser.add_argument(
+            "--num_labels",
+            type=int,
+            default=None,
+            help="num_labels for the pre-processor and the model.",
+    )
+        
+    
     parser.set_defaults(**defaults)
 
     args = parser.parse_args()
@@ -670,6 +756,8 @@ def main():
     if Path(args.dataset_name).is_dir():
         logger.info(f"Loading local COCO dataset from {args.dataset_name}")
         
+
+        # 
         # Initialize image processor using the model's mask2former_model_name
         image_processor = AutoImageProcessor.from_pretrained(
             image_processor_model,
@@ -678,8 +766,11 @@ def main():
             do_reduce_labels=args.do_reduce_labels,
             reduce_labels=args.do_reduce_labels,
             token=args.hub_token,
+            num_labels = args.num_labels,
             use_fast=True
         )
+
+        rprint(f"image_processor: {image_processor}")
         
         # Define augmentations
         train_transform = A.Compose([A.NoOp()])
@@ -737,8 +828,6 @@ def main():
 
         print("Loaded label2id count:", len(model.label2id))
 
-        from rich import print as rprint
-
         # rprint(f"linear predictor weights check: {model.inner_model.class_predictor.weight[0][:5]}")
 
     else:
@@ -770,7 +859,10 @@ def main():
             do_reduce_labels=args.do_reduce_labels,
             reduce_labels=args.do_reduce_labels,
             token=args.hub_token,
+            num_labels = args.num_labels,
         )
+
+        rprint(f"image_processor: {image_processor}")
         
         # Define image augmentations
         train_augment_and_transform = A.Compose([A.NoOp()])
@@ -900,10 +992,11 @@ def main():
         "cache_dir": args.cache_dir,
     }
 
+    rprint(f"args.lr_scheduler_type: {args.lr_scheduler_type}")
     run_name = (
         f"{os.path.basename(args.model)}-"
         f"Mask2Former-E{wandb_config['epochs']}-BS{wandb_config['batch_size_per_device']}-"
-        f"LR{wandb_config['learning_rate']}"
+        f"LR{wandb_config['learning_rate']}-{args.lr_scheduler_type}"
     )
 
     run = wandb.init(
