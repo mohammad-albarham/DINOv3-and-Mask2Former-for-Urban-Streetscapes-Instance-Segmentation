@@ -20,13 +20,18 @@ from rich import print as rprint
 class Adapter(nn.Module):
     """
     Adapter module to convert DINOv3 features to expected channels for Mask2Former head.
+    Adds normalization and nonlinearity to stabilize training.
     """
 
     def __init__(self, in_channels: int, out_channels: List[int]):
         super().__init__()
-        self.projections = nn.ModuleList(
-            [nn.Conv2d(in_channels, out_ch, kernel_size=1) for out_ch in out_channels]
-        )
+        self.projections = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(in_channels, out_ch, kernel_size=1),
+                nn.GroupNorm(32, out_ch),
+                nn.GELU()
+            ) for out_ch in out_channels
+        ])
 
     def forward(self, features: List[torch.Tensor]) -> List[torch.Tensor]:
         return [self.projections[i](feat) for i, feat in enumerate(features)]
@@ -34,60 +39,56 @@ class Adapter(nn.Module):
 
 class DinoV3WithAdapterBackbone(nn.Module):
     """
-    Custom backbone that combines DINOv3 with adapter layers for Mask2Former compatibility.
+    Custom backbone combining DINOv3 with Adapter layers for Mask2Former.
+    Uses interpolated multi-scale features to mimic CNN-like pyramid output.
     """
 
     def __init__(self, model_name: str, out_channels: List[int]):
         super().__init__()
         self.model = AutoModel.from_pretrained(model_name)
-        self.adapter = Adapter(self.model.config.hidden_size, out_channels)
+        self.hidden_size = self.model.config.hidden_size
+        self.adapter = Adapter(self.hidden_size, out_channels)
 
-        # Define output features for Mask2Former compatibility
         self.out_features = [f"stage_{i}" for i in range(len(out_channels))]
-        self._out_feature_channels = {
-            name: ch for name, ch in zip(self.out_features, out_channels)
-        }
-        self._out_feature_strides = {
-            "stage_0": 8,
-            "stage_1": 16,
-            "stage_2": 32,
-            "stage_3": 32,
-        }
+        self._out_feature_channels = dict(zip(self.out_features, out_channels))
+        self._out_feature_strides = {"stage_0": 4, "stage_1": 8, "stage_2": 16, "stage_3": 32}
 
-        # Layers to extract from DINOv3 (different depths for multi-scale features)
-        self.layers_to_extract = [2, 5, 8, 11]
+        # Select deeper layers to capture progressively abstract representations
+        self.layers_to_extract = [4, 7, 9, 11]
+
+    def _resize_features(self, feat: torch.Tensor) -> List[torch.Tensor]:
+        """Generate multi-scale versions of the final feature map."""
+        return [
+            torch.nn.functional.interpolate(feat, scale_factor=s, mode='bilinear', align_corners=False)
+            for s in [1.0, 0.5, 0.25, 0.125]
+        ]
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        # Get DINOv3 outputs with all hidden states
-        outputs = self.model(
-            pixel_values=x, output_hidden_states=True, return_dict=True
-        )
+        outputs = self.model(pixel_values=x, output_hidden_states=True, return_dict=True)
         hidden_states = outputs.hidden_states
 
-        # Calculate spatial dimensions after patch embedding
         batch_size, _, height, width = x.shape
-        patch_size = self.model.config.patch_size
-        patch_height, patch_width = height // patch_size, width // patch_size
+        patch = self.model.config.patch_size
+        patch_h, patch_w = height // patch, width // patch
 
-        # Extract features from different layers
+        # Use last hidden layer for pyramid generation + others for diversity
         extracted_features = []
         for layer_idx in self.layers_to_extract:
-            layer_output = hidden_states[layer_idx + 1]  # Skip CLS token
-            # Reshape from (B, N, C) to (B, C, H, W)
-            feature_map = (
-                layer_output[:, 1:, :]
-                .permute(0, 2, 1)
-                .reshape(
-                    batch_size, self.model.config.hidden_size, patch_height, patch_width
-                )
-            )
+            # num_reg = self.model.config.num_register_tokens
+            # feature_map = hidden_states[layer_idx + 1][:, 1 + num_reg:, :]
+            feature_map = hidden_states[layer_idx + 1][:, 1:, :] \
+                .permute(0, 2, 1) \
+                .reshape(batch_size, self.hidden_size, patch_h, patch_w)
             extracted_features.append(feature_map)
 
-        # Apply adapter to convert channels
-        adapted_features = self.adapter(extracted_features)
 
-        # Return features with proper naming for Mask2Former
-        return {name: feat for name, feat in zip(self.out_features, adapted_features)}
+
+        # For prefer pyramid from last layer only:
+        # This should be faster since it reduces the number of parameters
+        # extracted_features = self._resize_features(extracted_features[-1])
+
+        adapted_features = self.adapter(extracted_features)
+        return {k: v for k, v in zip(self.out_features, adapted_features)}
 
 from huggingface_hub.utils._typing import is_jsonable
 
@@ -114,7 +115,7 @@ class Mask2Former_Dinov3(nn.Module, PyTorchModelHubMixin):
         self.hub_token = hub_token
         # self.mask2former_model_name = mask2former_model_name
 
-        mask2former_model_name = "facebook/mask2former-swin-small-coco-instance"
+        mask2former_model_name = "facebook/mask2former-swin-large-mapillary-vistas-semantic"
         # Build the Mask2Former model
         model = AutoModelForUniversalSegmentation.from_pretrained(
             mask2former_model_name,
@@ -127,9 +128,13 @@ class Mask2Former_Dinov3(nn.Module, PyTorchModelHubMixin):
             dinov3_model_name, expected_channels
         )
         model.model.backbone = custom_backbone
+
+
         if freeze_backbone:
             for param in model.model.backbone.model.parameters():
                 param.requires_grad = False
+            rprint("[yellow]Backbone frozen — only adapter and Mask2Former head will train.[/yellow]")
+
 
         # Attach configs
         dino_config = AutoConfig.from_pretrained(dinov3_model_name)
@@ -139,32 +144,9 @@ class Mask2Former_Dinov3(nn.Module, PyTorchModelHubMixin):
         mask2former_model_name_config.backbone_config = dino_config
         model.config = mask2former_model_name_config
        
-       # Edit Start here
-        # rprint("Number of trainable parameters before freezing:",
-        # sum(p.numel() for p in model.parameters() if p.requires_grad))
-
-        # # A trial to have a better performance of the model 
-        # # by freeze everything except the adapter and the final linear layer
-
-        # # # Freeze DINOv3 backbone
-        # # for param in model.model.backbone.parameters():
-        # #     param.requires_grad = False
-
-        # # Freeze all parameters in the entire model
-        # for param in model.parameters():
-        #     param.requires_grad = False
-
-        # # Unfreeze Adapter
-        # for param in model.model.backbone.adapter.parameters():
-        #     param.requires_grad = True
-
-        # # Unfreeze classification head (Mask2Former class predictor)
-        # for param in model.class_predictor.parameters():
-        #     param.requires_grad = True
-        # # # Edit Ends here
+ 
         self.inner_model = model
         self.config = model.config  # For HF compatibility
-       
        
         # Edit Start here
 
