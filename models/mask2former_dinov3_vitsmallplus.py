@@ -10,98 +10,103 @@ import torch.nn as nn
 from typing import List, Dict
 from transformers import AutoModel, AutoModelForUniversalSegmentation, AutoConfig
 import logging
-# from huggingface_hub import PyTorchModelHubMixin
 
 logger = logging.getLogger(__name__)
 from huggingface_hub import PyTorchModelHubMixin
 
 from rich import print as rprint
 
+import torch
+import torch.nn as nn
+from typing import Dict, List
+from transformers import AutoModel, AutoModelForUniversalSegmentation, AutoConfig
+from huggingface_hub import PyTorchModelHubMixin
+from huggingface_hub.utils._typing import is_jsonable
+
+# Assuming rich for rprint; fallback to print
+try:
+    from rich import print as rprint
+except ImportError:
+    rprint = print
+
+
 class Adapter(nn.Module):
     """
-    Adapter module to convert DINOv3 features to expected channels for Mask2Former head.
-    Adds normalization and nonlinearity to stabilize training.
+    Adapter to project multi-layer DINOv3 features to Mask2Former-expected channels.
+    Each layer gets its own projection (1x1 conv) for progressive channel matching.
     """
-
     def __init__(self, in_channels: int, out_channels: List[int]):
         super().__init__()
-        self.projections = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(in_channels, out_ch, kernel_size=1),
-                nn.GroupNorm(32, out_ch),
-                nn.GELU()
-            ) for out_ch in out_channels
-        ])
+        self.projections = nn.ModuleList(
+            [nn.Conv2d(in_channels, out_ch, kernel_size=1) for out_ch in out_channels]
+        )
 
     def forward(self, features: List[torch.Tensor]) -> List[torch.Tensor]:
+        # Assume features are already at common resolution; project each independently
         return [self.projections[i](feat) for i, feat in enumerate(features)]
 
 
 class DinoV3WithAdapterBackbone(nn.Module):
     """
-    Custom backbone combining DINOv3 with Adapter layers for Mask2Former.
-    Uses interpolated multi-scale features to mimic CNN-like pyramid output.
+    Custom backbone: DINOv3 with SegDINO-inspired multi-layer extraction for semantic multi-scale.
+    Extracts from layers [3,6,9,12], projects channels; all at native stride=16.
     """
-
     def __init__(self, model_name: str, out_channels: List[int]):
         super().__init__()
         self.model = AutoModel.from_pretrained(model_name)
-        self.hidden_size = self.model.config.hidden_size
-        self.adapter = Adapter(self.hidden_size, out_channels)
+        self.adapter = Adapter(self.model.config.hidden_size, out_channels)
 
+        # Output features named for Mask2Former
         self.out_features = [f"stage_{i}" for i in range(len(out_channels))]
-        self._out_feature_channels = dict(zip(self.out_features, out_channels))
-        self._out_feature_strides = {"stage_0": 4, "stage_1": 8, "stage_2": 16, "stage_3": 32}
+        self._out_feature_channels = {
+            name: ch for name, ch in zip(self.out_features, out_channels)
+        }
+        # Uniform stride for DINOv3 (ViT: all layers same res; patch_size=16)
+        stride = 16  # Adjust to self.model.config.patch_size if needed
+        self._out_feature_strides = {name: stride for name in self.out_features}
 
-        # Select deeper layers to capture progressively abstract representations
-        self.layers_to_extract = [4, 7, 9, 11]
-
-    def _resize_features(self, feat: torch.Tensor) -> List[torch.Tensor]:
-        """Generate multi-scale versions of the final feature map."""
-        return [
-            torch.nn.functional.interpolate(feat, scale_factor=s, mode='bilinear', align_corners=False)
-            for s in [1.0, 0.5, 0.25, 0.125]
-        ]
+        # SegDINO-inspired: Extract from early/mid/late layers for semantic multi-scale
+        self.layers_to_extract = [3, 6, 9, 12]  # Layers 0-indexed; +1 in hidden_states
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        # DINOv3 forward with hidden states
         outputs = self.model(pixel_values=x, output_hidden_states=True, return_dict=True)
         hidden_states = outputs.hidden_states
 
+        # Spatial dims post-patch embed
         batch_size, _, height, width = x.shape
-        patch = self.model.config.patch_size
-        patch_h, patch_w = height // patch, width // patch
+        patch_size = self.model.config.patch_size
+        feat_h, feat_w = height // patch_size, width // patch_size
 
-        # Use last hidden layer for pyramid generation + others for diversity
+        # Extract and reshape each selected layer (ignore CLS token)
         extracted_features = []
         for layer_idx in self.layers_to_extract:
-            # num_reg = self.model.config.num_register_tokens
-            # feature_map = hidden_states[layer_idx + 1][:, 1 + num_reg:, :]
-            feature_map = hidden_states[layer_idx + 1][:, 1:, :] \
-                .permute(0, 2, 1) \
-                .reshape(batch_size, self.hidden_size, patch_h, patch_w)
+            layer_output = hidden_states[layer_idx + 1]  # hidden_states[0] is embed, [1]=layer0
+            feature_map = (
+                layer_output[:, 1:, :]  # Remove CLS
+                .permute(0, 2, 1)
+                .reshape(batch_size, self.model.config.hidden_size, feat_h, feat_w)
+            )
+            # SegDINO: Align to common res (all already same, but bilinear if needed for variants)
+            # If future variants have varying res, add: F.interpolate(feature_map, size=(feat_h, feat_w), mode='bilinear')
             extracted_features.append(feature_map)
 
-
-
-        # For prefer pyramid from last layer only:
-        # This should be faster since it reduces the number of parameters
-        # extracted_features = self._resize_features(extracted_features[-1])
-
+        # Project channels per layer (progressive: early layer -> fewer channels)
         adapted_features = self.adapter(extracted_features)
-        return {k: v for k, v in zip(self.out_features, adapted_features)}
 
-from huggingface_hub.utils._typing import is_jsonable
+        # Return dict for Mask2Former
+        return {name: feat for name, feat in zip(self.out_features, adapted_features)}
+
 
 class Mask2Former_Dinov3(nn.Module, PyTorchModelHubMixin):
     def __init__(
         self,
         label2id: Dict[str, int],
         id2label: Dict[int, str],
-        dinov3_model_name: str = "facebook/dinov3-vits16plus-pretrain-lvd1689m",
+        dinov3_model_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m",  # Base/16 for hidden=768; adjust as needed
         expected_channels: List[int] = [96, 192, 384, 768],
         freeze_backbone: bool = True,
         hub_token: str = None,
-        # mask2former_model_name: str = "facebook/mask2former-swin-small-coco-instance"
     ):
         super().__init__()
 
@@ -113,10 +118,8 @@ class Mask2Former_Dinov3(nn.Module, PyTorchModelHubMixin):
         self.expected_channels = expected_channels
         self.freeze_backbone = freeze_backbone
         self.hub_token = hub_token
-        # self.mask2former_model_name = mask2former_model_name
 
         mask2former_model_name = "facebook/mask2former-swin-large-mapillary-vistas-semantic"
-        # Build the Mask2Former model
         model = AutoModelForUniversalSegmentation.from_pretrained(
             mask2former_model_name,
             label2id=label2id,
@@ -124,40 +127,51 @@ class Mask2Former_Dinov3(nn.Module, PyTorchModelHubMixin):
             ignore_mismatched_sizes=True,
             token=hub_token,
         )
-        custom_backbone = DinoV3WithAdapterBackbone(
-            dinov3_model_name, expected_channels
-        )
+        custom_backbone = DinoV3WithAdapterBackbone(dinov3_model_name, expected_channels)
         model.model.backbone = custom_backbone
-
-
         if freeze_backbone:
             for param in model.model.backbone.model.parameters():
                 param.requires_grad = False
-            rprint("[yellow]Backbone frozen — only adapter and Mask2Former head will train.[/yellow]")
 
+        # Config updates for uniform DINOv3 strides (SegDINO-style semantic multi-scale)
+        model.config.feature_strides = [16, 16, 16, 16]
+        model.config.common_stride = 16
+        # Optional: Adjust pixel decoder if needed (e.g., in_maskformer_self_attention for fusion)
 
-        # Attach configs
+        # HF compatibility configs
         dino_config = AutoConfig.from_pretrained(dinov3_model_name)
         dino_config.architectures = ["DinoV3WithAdapterBackbone"]
-        mask2former_model_name_config = AutoConfig.from_pretrained(mask2former_model_name)
-        mask2former_model_name_config.model_type = "mask2former-with-dinov3"
-        mask2former_model_name_config.backbone_config = dino_config
-        model.config = mask2former_model_name_config
-       
- 
+        mask2former_config = AutoConfig.from_pretrained(mask2former_model_name)
+        mask2former_config.model_type = "mask2former-with-dinov3-segdino"
+        mask2former_config.backbone_config = dino_config
+        model.config = mask2former_config
+
         self.inner_model = model
-        self.config = model.config  # For HF compatibility
-       
-        # Edit Start here
+        self.config = model.config
 
-        rprint("Number of trainable parameters after freezing:",
-        sum(p.numel() for p in self.inner_model.parameters() if p.requires_grad))
+        # Param count
+        trainable_params = sum(p.numel() for p in self.inner_model.parameters() if p.requires_grad)
+        rprint(f"Number of trainable parameters after optimizations: {trainable_params}")
 
-        # rprint("\nTrainable parameters (name):")
+        # Debug breakdown
+        total_params = sum(p.numel() for p in self.inner_model.parameters())
+        backbone_total = sum(p.numel() for p in model.model.backbone.parameters())
+        backbone_trainable = sum(p.numel() for p in model.model.backbone.parameters() if p.requires_grad)
+        head_trainable = trainable_params - backbone_trainable
+        rprint(f"Total params: {total_params}")
+        rprint(f"Backbone total: {backbone_total}, trainable: {backbone_trainable} (adapter mainly)")
+        rprint(f"Head trainable: {head_trainable}")
+
+        # Optional: List top trainable modules
+        # trainable_modules = {name: sum(p.numel() for p in module.parameters() if p.requires_grad) 
+        #                     for name, module in model.named_modules() if sum(p.numel() for p in module.parameters() if p.requires_grad) > 100000}
+        # for name, count in trainable_modules.items():
+        #     rprint(f"{name}: {count}")
+
+        # Optional details
         # for name, param in self.inner_model.named_parameters():
         #     if param.requires_grad:
-        #         rprint(name, param.shape)
-        # Edit Ends here
+        #         rprint(f"{name}: {param.shape}")
 
     def forward(self, *args, **kwargs):
         return self.inner_model(*args, **kwargs)
