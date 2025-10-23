@@ -21,7 +21,7 @@ class MapillaryInstanceDataset(Dataset):
     """
     Mapillary Vistas Dataset for Instance Segmentation
     """
-    def __init__(self, root_dir, version='v2.0', split='training', transforms=None):
+    def __init__(self, root_dir, version='v2.0', split='validation', transforms=None):
         """
         Args:
             root_dir: Root directory containing the dataset
@@ -57,9 +57,11 @@ class MapillaryInstanceDataset(Dataset):
                 self.label_id_to_class_id[class_id] = len([l for l in self.labels[:class_id+1] if l["instances"]])
 
         # Get all image IDs
-        images_dir = os.path.join(root_dir, split, 'images')
+        images_dir = os.path.join(root_dir, "validation", 'images')
         self.image_files = sorted(glob.glob(os.path.join(images_dir, '*.jpg')))
         self.image_ids = [os.path.splitext(os.path.basename(f))[0] for f in self.image_files]
+
+        self.image_ids = ['--BJs76vloEaiH-wppzWNA']
 
         print(f"Loaded {len(self.image_ids)} images from {split} split")
         print(f"Number of thing classes (with instances): {len(self.thing_classes)}")
@@ -204,9 +206,9 @@ def create_dataloaders(root_dir, version='v2.0', batch_size=2,
     """
     # Create training dataset and split into train/test
     train_full = MapillaryInstanceDataset(
-        root_dir=root_dir,
+        root_dir= root_dir,
         version=version,
-        split='training',
+        split='validation',
         transforms=get_transform(train=True)
     )
     train_total = len(train_full)
@@ -297,9 +299,9 @@ train_loader, val_loader, test_loader, num_classes = create_dataloaders(
     root_dir=DATASET_ROOT,
     version=VERSION,
     batch_size=1,
-    train_split=0.7,
-    val_split=0.5,
-    test_split=0.5,
+    train_split=1.0,
+    val_split=1.0,
+    test_split=1.0,
     num_workers=0  # Set to 0 for debugging, increase for faster loading
 )
 

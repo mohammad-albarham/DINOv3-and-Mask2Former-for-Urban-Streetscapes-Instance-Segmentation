@@ -7,18 +7,27 @@ url = "http://images.cocodataset.org/val2017/000000039769.jpg"
 image = load_image(url)
 
 #%%
+
+image
+#%%
 pretrained_model_name = "facebook/dinov3-vit7b16-pretrain-lvd1689m"
 processor = AutoImageProcessor.from_pretrained(pretrained_model_name)
 
 print(processor)
 
+#%%
 model = AutoModel.from_pretrained(
     pretrained_model_name, 
     device_map="auto", 
 )
+#%%
+model
 
 #%%
 inputs = processor(images=image, return_tensors="pt").to(model.device)
+
+#%%
+inputs.pixel_values.shape
 
 #%%
 
@@ -33,6 +42,9 @@ for itm, val in inputs.items():
 with torch.inference_mode():
     outputs = model(**inputs)
 
+#%%
+
+outputs
 
 #%%
 from rich import inspect
@@ -67,6 +79,7 @@ inputs = processor(images=image, return_tensors="pt").to(model.device)
 with torch.inference_mode():
     outputs = model(**inputs)
 
+#%%
 pooled_output = outputs.pooler_output
 print("Pooled output shape:", pooled_output.shape)
 

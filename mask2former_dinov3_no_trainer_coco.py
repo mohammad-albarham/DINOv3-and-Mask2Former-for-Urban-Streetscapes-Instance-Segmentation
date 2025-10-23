@@ -79,6 +79,139 @@ check_min_version("4.56.0.dev0")
 
 from rich import print as rprint
 
+
+import torch
+
+def get_parameter_groups(model, base_lr=5e-5):
+    """
+    Create parameter groups with differential learning rates
+    
+    Strategy:
+    - Adapter: Highest LR (needs most adaptation)
+    - Encoder: Medium LR (some adaptation needed)
+    - Decoder: Lower LR (already pretrained on Mapillary)
+    - Class/Mask heads: High LR (task-specific)
+    """
+    
+    # Initialize parameter groups
+    adapter_params = []
+    encoder_params = []
+    decoder_params = []
+    head_params = []
+    other_params = []
+    
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+            
+        # Group 1: Channel adapter (highest LR - needs most learning)
+        if 'adapter' in name.lower() or 'backbone.adapter' in name:
+            adapter_params.append(param)
+            
+        # Group 2: Transformer encoder (medium LR)
+        elif 'encoder' in name.lower() or 'input_proj' in name or 'level_embed' in name:
+            encoder_params.append(param)
+            
+        # Group 3: Prediction heads (high LR - task-specific)
+        elif 'class_predictor' in name or 'mask_predictor' in name or 'class_embed' in name or 'mask_embed' in name:
+            head_params.append(param)
+            
+        # Group 4: Decoder (lower LR - already well-pretrained)
+        elif 'decoder' in name.lower() or 'transformer_module' in name:
+            decoder_params.append(param)
+            
+        # Group 5: Everything else (medium LR)
+        else:
+            other_params.append(param)
+    
+    # Create parameter groups with differential LRs
+    param_groups = []
+    
+    if adapter_params:
+        param_groups.append({
+            'params': adapter_params,
+            'lr': base_lr * 10,  # 10x base LR for adapter
+            'name': 'adapter'
+        })
+        print(f"✓ Adapter params: {sum(p.numel() for p in adapter_params):,} with LR={base_lr * 10}")
+    
+    if head_params:
+        param_groups.append({
+            'params': head_params,
+            'lr': base_lr * 5,  # 5x base LR for prediction heads
+            'name': 'heads'
+        })
+        print(f"✓ Head params: {sum(p.numel() for p in head_params):,} with LR={base_lr * 5}")
+    
+    if encoder_params:
+        param_groups.append({
+            'params': encoder_params,
+            'lr': base_lr * 2,  # 2x base LR for encoder
+            'name': 'encoder'
+        })
+        print(f"✓ Encoder params: {sum(p.numel() for p in encoder_params):,} with LR={base_lr * 2}")
+    
+    if decoder_params:
+        param_groups.append({
+            'params': decoder_params,
+            'lr': base_lr,  # Base LR for decoder (already trained)
+            'name': 'decoder'
+        })
+        print(f"✓ Decoder params: {sum(p.numel() for p in decoder_params):,} with LR={base_lr}")
+    
+    if other_params:
+        param_groups.append({
+            'params': other_params,
+            'lr': base_lr * 2,  # 2x base LR for other components
+            'name': 'other'
+        })
+        print(f"✓ Other params: {sum(p.numel() for p in other_params):,} with LR={base_lr * 2}")
+    
+    return param_groups
+
+
+# Replace your optimizer initialization with this:
+def create_optimizer(model, args):
+    """
+    Create AdamW optimizer with differential learning rates
+    """
+    # Get parameter groups with differential LRs
+    # Base LR from args, components get multipliers
+    param_groups = get_parameter_groups(model, base_lr=args.learning_rate)
+    
+    # Create optimizer with parameter groups
+    optimizer = torch.optim.AdamW(
+        param_groups,
+        weight_decay=args.weight_decay if hasattr(args, 'weight_decay') else 0.05,
+        betas=[args.adam_beta1, args.adam_beta2] if hasattr(args, 'adam_beta1') else [0.9, 0.999],
+        eps=args.adam_epsilon if hasattr(args, 'adam_epsilon') else 1e-8,
+    )
+    
+    print(f"\n{'='*70}")
+    print("Optimizer Configuration:")
+    print(f"{'='*70}")
+    print(f"Base Learning Rate: {args.learning_rate}")
+    print(f"Weight Decay: {0.05}")
+    print(f"Betas: {[0.9, 0.999]}")
+    print(f"Total trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    print(f"{'='*70}\n")
+    
+    return optimizer
+
+
+# Usage in your training script:
+# Replace:
+# optimizer = torch.optim.AdamW(
+#     list(model.parameters()),
+#     ...
+# )
+
+# With:
+
+
+
+
+
 def load_model_from_config(model_path: str):
     """
     Dynamically load model creation function and mask2former model name from the specified Python file.
@@ -177,7 +310,7 @@ class MapillaryInstanceDataset(Dataset):
 
         if split == "training":
 
-            N_train = 6000
+            N_train = 3000
            
             self.image_ids = self.image_ids[:N_train]  # Only use first N
             # self.image_ids = ['--BJs76vloEaiH-wppzWNA']
@@ -190,7 +323,7 @@ class MapillaryInstanceDataset(Dataset):
             print("Saved image file list to image_files.txt")
 
         else:
-            N_val = 500
+            N_val = 600
 
             self.image_ids = self.image_ids[:N_val]  # Only use first N
             # self.image_ids = ['--BJs76vloEaiH-wppzWNA']
@@ -273,13 +406,14 @@ class MapillaryInstanceDataset(Dataset):
             instance_id_to_semantic_id=instance_to_semantic,
             return_tensors="pt",
         )
-
         return {
             "pixel_values": inputs.pixel_values[0],
             "mask_labels": inputs.mask_labels[0],
             "class_labels": inputs.class_labels[0],
             "original_size": (h, w),
         }
+    
+
 
     def get_num_classes(self):
         """Returns number of classes including background"""
@@ -366,24 +500,24 @@ def evaluation_loop(model, image_processor, accelerator: Accelerator, dataloader
             
             with torch.no_grad():
                 outputs = model(**inputs)
+
+                
+            # Get target sizes for current batch
+            if original_sizes is not None:
+                current_target_sizes = original_sizes
+            else:
+                current_target_sizes = [masks.shape[-2:] for masks in inputs["mask_labels"]]
+            
+            # Process predictions for current batch (local GPU only)
+            post_processed_output = image_processor.post_process_instance_segmentation(
+                outputs,
+                threshold=0.0,
+                target_sizes=current_target_sizes,
+                return_binary_maps=True,
+            )
         except Exception as e:
             rprint(f"An error occurred: {e}")
             continue
-            
-        # Get target sizes for current batch
-        if original_sizes is not None:
-            current_target_sizes = original_sizes
-        else:
-            current_target_sizes = [masks.shape[-2:] for masks in inputs["mask_labels"]]
-        
-        # Process predictions for current batch (local GPU only)
-        post_processed_output = image_processor.post_process_instance_segmentation(
-            outputs,
-            threshold=0.0,
-            target_sizes=current_target_sizes,
-            return_binary_maps=True,
-        )
-        
         # Prepare predictions and targets for current batch
         post_processed_predictions = []
         post_processed_targets = []
@@ -509,6 +643,13 @@ def setup_logging(accelerator: Accelerator) -> None:
         transformers.utils.logging.set_verbosity_error()
 
 
+import argparse
+import json
+import os
+from transformers import SchedulerType
+
+
+
 def handle_repository_creation(accelerator: Accelerator, args: argparse.Namespace):
     """Create a repository for the model and dataset if `args.push_to_hub` is set."""
 
@@ -535,6 +676,7 @@ def handle_repository_creation(accelerator: Accelerator, args: argparse.Namespac
     return repo_id
 
 
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model for instance segmentation task")
 
@@ -555,6 +697,9 @@ def parse_args():
         with open(temp_args.config, 'r') as f:
             defaults = json.load(f)
 
+    # ========================================================================
+    # Model and Dataset Configuration
+    # ========================================================================
     parser.add_argument(
         "--model",
         type=str,
@@ -565,7 +710,6 @@ def parse_args():
         "--dataset_name",
         type=str,
         help="Name of the dataset on the hub or path to mapillary dataset.",
-        
     )
     parser.add_argument(
         "--trust_remote_code",
@@ -576,16 +720,20 @@ def parse_args():
             " code, as it will execute code present on the Hub on your local machine."
         ),
     )
+    
+    # ========================================================================
+    # Image Processing Configuration
+    # ========================================================================
     parser.add_argument(
         "--image_height",
         type=int,
-        default=384,
+        default=512,  # Changed from 384 to 512 for better quality
         help="The height of the images to feed the model.",
     )
     parser.add_argument(
         "--image_width",
         type=int,
-        default=384,
+        default=512,  # Changed from 384 to 512 for better quality
         help="The width of the images to feed the model.",
     )
     parser.add_argument(
@@ -593,6 +741,10 @@ def parse_args():
         action="store_true",
         help="Whether to reduce the number of labels by removing the background class.",
     )
+    
+    # ========================================================================
+    # Data Loading Configuration
+    # ========================================================================
     parser.add_argument(
         "--cache_dir",
         type=str,
@@ -601,26 +753,48 @@ def parse_args():
     parser.add_argument(
         "--per_device_train_batch_size",
         type=int,
-        default=8,
+        default=4,  # Changed from 8 to 4 for M3 Max (safer with 512x512)
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument(
         "--per_device_eval_batch_size",
         type=int,
-        default=8,
+        default=4,  # Changed from 8 to 4
         help="Batch size (per device) for the evaluation dataloader.",
     )
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
-        default=0,
+        default=4,  # Changed from 0 to 4 for faster data loading
         help="Number of workers to use for the dataloaders.",
     )
     parser.add_argument(
+        "--dataloader_prefetch_factor",
+        type=int,
+        default=2,  # NEW: Prefetch batches for speed
+        help="Number of batches to prefetch per worker.",
+    )
+    parser.add_argument(
+        "--dataloader_pin_memory",
+        action="store_true",
+        default=False,  # False for MPS (True for CUDA)
+        help="Whether to pin memory in data loaders.",
+    )
+    
+    # ========================================================================
+    # Optimization Configuration
+    # ========================================================================
+    parser.add_argument(
         "--learning_rate",
         type=float,
-        default=5e-5,
-        help="Initial learning rate (after the potential warmup period) to use.",
+        default=1e-4,  # Base learning rate for differential LR
+        help="Base learning rate (will be modified for different components with differential LR).",
+    )
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=0.05,  # NEW: Increased for better generalization
+        help="Weight decay for AdamW optimizer.",
     )
     parser.add_argument(
         "--adam_beta1",
@@ -640,7 +814,56 @@ def parse_args():
         default=1e-8,
         help="Epsilon for AdamW optimizer",
     )
-    parser.add_argument("--num_train_epochs", type=int, default=3, help="Total number of training epochs to perform.")
+    parser.add_argument(
+        "--max_grad_norm",
+        type=float,
+        default=1.0,  # NEW: Gradient clipping
+        help="Maximum gradient norm for clipping.",
+    )
+    
+    # ========================================================================
+    # NEW: Differential Learning Rate Configuration
+    # ========================================================================
+    parser.add_argument(
+        "--use_differential_lr",
+        action="store_true",
+        default=True,  # Enable by default
+        help="Whether to use differential learning rates for different model components.",
+    )
+    parser.add_argument(
+        "--adapter_lr_multiplier",
+        type=float,
+        default=10.0,  # Adapter gets 10x base LR
+        help="Learning rate multiplier for adapter layers.",
+    )
+    parser.add_argument(
+        "--head_lr_multiplier",
+        type=float,
+        default=5.0,  # Prediction heads get 5x base LR
+        help="Learning rate multiplier for classification/mask prediction heads.",
+    )
+    parser.add_argument(
+        "--encoder_lr_multiplier",
+        type=float,
+        default=2.0,  # Encoder gets 2x base LR
+        help="Learning rate multiplier for transformer encoder.",
+    )
+    parser.add_argument(
+        "--decoder_lr_multiplier",
+        type=float,
+        default=1.0,  # Decoder gets base LR (already pretrained)
+        help="Learning rate multiplier for transformer decoder.",
+    )
+    
+    # ========================================================================
+    # Training Configuration
+    # ========================================================================
+    parser.add_argument(
+        "--num_train_epochs",
+        type=int,
+        default=25,  # Increased from 20 to 25 for better convergence
+        help="Total number of training epochs to perform."
+    )
     parser.add_argument(
         "--max_train_steps",
         type=int,
@@ -650,31 +873,145 @@ def parse_args():
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=1,
+        default=4,  # Effective batch size = 4 * 4 = 16
         help="Number of updates steps to accumulate before performing a backward/update pass.",
     )
+    
+    # ========================================================================
+    # Learning Rate Scheduler Configuration
+    # ========================================================================
     parser.add_argument(
         "--lr_scheduler_type",
         type=SchedulerType,
-        default="linear",
+        default="cosine",  # Changed from linear to cosine
         help="The scheduler type to use.",
         choices=["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"],
     )
     parser.add_argument(
-        "--num_warmup_steps", type=int, default=0, help="Number of steps for the warmup in the lr scheduler."
+        "--num_warmup_steps",
+        type=int,
+        default=None,  # Will be calculated from warmup_ratio
+        help="Number of steps for the warmup in the lr scheduler."
     )
-    parser.add_argument("--output_dir", type=str, default=None, help="Where to store the final model.")
-    parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
-    parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
     parser.add_argument(
-        "--hub_model_id", type=str, help="The name of the repository to keep in sync with the local `output_dir`."
+        "--warmup_ratio",
+        type=float,
+        default=0.05,  # NEW: 5% warmup (more flexible than fixed steps)
+        help="Ratio of total training steps to use for warmup.",
     )
-    parser.add_argument("--hub_token", type=str, help="The token to use to push to the Model Hub.")
+    parser.add_argument(
+        "--lr_end_ratio",
+        type=float,
+        default=0.01,  # NEW: End at 1% of initial LR
+        help="Ratio of initial learning rate to end at (for cosine/polynomial schedulers).",
+    )
+    
+    # ========================================================================
+    # Evaluation and Checkpointing
+    # ========================================================================
     parser.add_argument(
         "--checkpointing_steps",
         type=str,
-        default=None,
+        default="500",  # Save every 500 steps
         help="Whether the various states should be saved at the end of every n steps, or 'epoch' for each epoch.",
+    )
+    parser.add_argument(
+        "--evaluation_strategy",
+        type=str,
+        default="steps",  # NEW: Evaluate on steps
+        choices=["no", "steps", "epoch"],
+        help="The evaluation strategy to use.",
+    )
+    parser.add_argument(
+        "--eval_steps",
+        type=int,
+        default=500,  # NEW: Evaluate every 500 steps
+        help="Number of update steps between evaluations.",
+    )
+    parser.add_argument(
+        "--save_strategy",
+        type=str,
+        default="steps",  # NEW: Save on steps
+        choices=["no", "steps", "epoch"],
+        help="The checkpoint save strategy to use.",
+    )
+    parser.add_argument(
+        "--save_steps",
+        type=int,
+        default=500,  # NEW: Save every 500 steps
+        help="Number of updates steps before saving checkpoint.",
+    )
+    parser.add_argument(
+        "--save_total_limit",
+        type=int,
+        default=3,  # NEW: Keep only best 3 checkpoints
+        help="Maximum number of checkpoints to keep.",
+    )
+    parser.add_argument(
+        "--load_best_model_at_end",
+        action="store_true",
+        default=True,  # NEW: Load best checkpoint at end
+        help="Whether to load the best model at the end of training.",
+    )
+    parser.add_argument(
+        "--metric_for_best_model",
+        type=str,
+        default="eval_map",  # NEW: Use mAP as best metric
+        help="Metric to use for selecting the best model.",
+    )
+    
+    # ========================================================================
+    # Logging Configuration
+    # ========================================================================
+    parser.add_argument(
+        "--logging_steps",
+        type=int,
+        default=50,  # NEW: Log every 50 steps
+        help="Number of update steps between logging.",
+    )
+    parser.add_argument(
+        "--report_to",
+        type=str,
+        default="tensorboard",  # NEW: Report to tensorboard
+        help="Where to report results (tensorboard, wandb, etc.).",
+    )
+    
+    # ========================================================================
+    # Output and Hub Configuration
+    # ========================================================================
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Where to store the final model."
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,  # Changed from None to 42 for reproducibility
+        help="A seed for reproducible training."
+    )
+    parser.add_argument(
+        "--push_to_hub",
+        action="store_true",
+        help="Whether or not to push the model to the Hub."
+    )
+    parser.add_argument(
+        "--hub_model_id",
+        type=str,
+        help="The name of the repository to keep in sync with the local `output_dir`."
+    )
+    parser.add_argument(
+        "--hub_token",
+        type=str,
+        help="The token to use to push to the Model Hub."
+    )
+    parser.add_argument(
+        "--hub_strategy",
+        type=str,
+        default="every_save",  # NEW: Push on every save
+        choices=["end", "every_save", "checkpoint", "all_checkpoints"],
+        help="Strategy to upload checkpoints to hub.",
     )
     parser.add_argument(
         "--resume_from_checkpoint",
@@ -683,16 +1020,60 @@ def parse_args():
         help="If the training should continue from a checkpoint folder.",
     )
     
+    # ========================================================================
+    # Model-Specific Configuration
+    # ========================================================================
     parser.add_argument(
-            "--num_labels",
-            type=int,
-            default=None,
-            help="num_labels for the pre-processor and the model.",
+        "--num_labels",
+        type=int,
+        default=12,  # Your 12 classes
+        help="Number of labels for the pre-processor and the model.",
     )
-        
     
+    # ========================================================================
+    # NEW: Model Architecture Configuration
+    # ========================================================================
+    parser.add_argument(
+        "--freeze_backbone",
+        action="store_true",
+        default=True,  # Keep DINOv3 frozen
+        help="Whether to freeze the backbone (DINOv3).",
+    )
+    parser.add_argument(
+        "--freeze_adapter",
+        action="store_true",
+        default=False,  # Train adapter with differential LR
+        help="Whether to freeze the adapter layers.",
+    )
+    parser.add_argument(
+        "--freeze_pixel_level",
+        action="store_true",
+        default=True,  # Keep pixel-level module frozen
+        help="Whether to freeze the pixel-level module.",
+    )
+    parser.add_argument(
+        "--freeze_encoder",
+        action="store_true",
+        default=False,  # Train encoder with differential LR
+        help="Whether to freeze the transformer encoder.",
+    )
+    parser.add_argument(
+        "--use_improved_adapter",
+        action="store_true",
+        default=True,  # Use enhanced adapter
+        help="Whether to use the improved adapter with SE blocks and fusion.",
+    )
+    parser.add_argument(
+        "--use_gradient_checkpointing",
+        action="store_true",
+        default=False,  # Not needed for M3 Max with 512x512
+        help="Whether to use gradient checkpointing for memory savings.",
+    )
+    
+    # ========================================================================
+    # Parse and Process Arguments
+    # ========================================================================
     parser.set_defaults(**defaults)
-
     args = parser.parse_args()
     
     # Load JSON config if provided and merge with command line args
@@ -705,6 +1086,11 @@ def parse_args():
             if not hasattr(args, key) or getattr(args, key) is None:
                 setattr(args, key, value)
     
+    # Calculate warmup steps if not provided
+    if args.num_warmup_steps is None and hasattr(args, 'warmup_ratio'):
+        # Will be calculated later when we know total steps
+        args.num_warmup_steps = None
+    
     # Validate required arguments
     if not args.model:
         raise ValueError("--model parameter is required (either via command line or config file)")
@@ -712,8 +1098,35 @@ def parse_args():
         raise ValueError("--dataset_name parameter is required (either via command line or config file)")
     if not args.output_dir:
         raise ValueError("--output_dir parameter is required (either via command line or config file)")
+    
+    # Create output directory
     if args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Print configuration summary
+    print("\n" + "="*70)
+    print("Training Configuration Summary")
+    print("="*70)
+    print(f"Model: {args.model}")
+    print(f"Dataset: {args.dataset_name}")
+    print(f"Output: {args.output_dir}")
+    print(f"\nImage size: {args.image_height}x{args.image_width}")
+    print(f"Batch size: {args.per_device_train_batch_size} (effective: {args.per_device_train_batch_size * args.gradient_accumulation_steps})")
+    print(f"Epochs: {args.num_train_epochs}")
+    print(f"Base LR: {args.learning_rate}")
+    
+    if args.use_differential_lr:
+        print(f"\nDifferential Learning Rates:")
+        print(f"  Adapter:  {args.learning_rate * args.adapter_lr_multiplier:.2e} ({args.adapter_lr_multiplier}x)")
+        print(f"  Heads:    {args.learning_rate * args.head_lr_multiplier:.2e} ({args.head_lr_multiplier}x)")
+        print(f"  Encoder:  {args.learning_rate * args.encoder_lr_multiplier:.2e} ({args.encoder_lr_multiplier}x)")
+        print(f"  Decoder:  {args.learning_rate * args.decoder_lr_multiplier:.2e} ({args.decoder_lr_multiplier}x)")
+    
+    print(f"\nScheduler: {args.lr_scheduler_type}")
+    print(f"Warmup ratio: {args.warmup_ratio}")
+    print(f"Weight decay: {args.weight_decay}")
+    print(f"Seed: {args.seed}")
+    print("="*70 + "\n")
 
     return args
 
@@ -767,7 +1180,8 @@ def main():
             reduce_labels=args.do_reduce_labels,
             token=args.hub_token,
             num_labels = args.num_labels,
-            use_fast=True
+            use_fast=True,
+            ignore_index=args.num_labels,
         )
 
         rprint(f"image_processor: {image_processor}")
@@ -820,11 +1234,23 @@ def main():
         id2label = {v: k for k, v in label2id.items()}
         
 
+        # model = Mask2Former_Dinov3(
+        #     label2id=label2id,
+        #     id2label=id2label,
+        #     freeze_backbone=True,
+        #     hub_token=args.hub_token)
+
+        # Initialize enhanced model
         model = Mask2Former_Dinov3(
             label2id=label2id,
             id2label=id2label,
+            dinov3_model_name="facebook/dinov3-vits16-pretrain-lvd1689m",
+            expected_channels=[96, 192, 384, 768],
             freeze_backbone=True,
-            hub_token=args.hub_token)
+            use_improved_adapter=True,  # KEY: Use enhanced adapter
+            freeze_adapter=False,  # KEY: Train the adapter for quick adaptation
+            use_gradient_checkpointing=False  # Enable if running out of memory
+        )
 
         print("Loaded label2id count:", len(model.label2id))
 
@@ -842,13 +1268,17 @@ def main():
             label2id = {name: idx - 1 for name, idx in label2id.items()}
         
         id2label = {v: k for k, v in label2id.items()}
-        
+        # Initialize enhanced model
         model = Mask2Former_Dinov3(
             label2id=label2id,
             id2label=id2label,
+            dinov3_model_name="facebook/dinov3-vits16-pretrain-lvd1689m",
+            expected_channels=[96, 192, 384, 768],
             freeze_backbone=True,
-            hub_token=args.hub_token)
-        
+            use_improved_adapter=True,  # KEY: Use enhanced adapter
+            freeze_adapter=False,  # KEY: Train the adapter for quick adaptation
+            use_gradient_checkpointing=False  # Enable if running out of memory
+        )
         print("Loaded label2id count:", len(model.label2id))
         
         # Use image processor from model's mask2former_model_name
@@ -906,7 +1336,7 @@ def main():
     
     valid_dataloader = DataLoader(
         val_dataset, 
-        shuffle=False, 
+        shuffle=True, 
         batch_size=args.per_device_eval_batch_size, 
         **dataloader_common_args
     )
@@ -915,13 +1345,7 @@ def main():
     # Define optimizer, scheduler and prepare everything with the accelerator
     # ------------------------------------------------------------------------------------------------
 
-    # Optimizer
-    optimizer = torch.optim.AdamW(
-        list(model.parameters()),
-        lr=args.learning_rate,
-        betas=[args.adam_beta1, args.adam_beta2],
-        eps=args.adam_epsilon,
-    )
+    optimizer = create_optimizer(model, args)
 
     # Figure out how many steps we should save the Accelerator states
     checkpointing_steps = args.checkpointing_steps
@@ -935,14 +1359,37 @@ def main():
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
 
-    lr_scheduler = get_scheduler(
-        name=args.lr_scheduler_type,
+    # ========================================================================
+    # SCHEDULER: Use Cosine
+    # ========================================================================
+    from transformers import get_cosine_schedule_with_warmup
+
+    # Calculate warmup steps
+    num_warmup_steps = int(args.warmup_ratio * args.max_train_steps) if hasattr(args, 'warmup_ratio') else int(0.05 * args.max_train_steps)
+
+    # OPTION 1: Cosine scheduler (RECOMMENDED for fine-tuning)
+    lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer=optimizer,
-        num_warmup_steps=args.num_warmup_steps * accelerator.num_processes,
-        num_training_steps=args.max_train_steps
-        if overrode_max_train_steps
-        else args.max_train_steps * accelerator.num_processes,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=args.max_train_steps,
+        num_cycles=0.5,  # Single cosine curve
     )
+    # from transformers import get_polynomial_decay_schedule_with_warmup
+    # lr_scheduler = get_polynomial_decay_schedule_with_warmup(
+    #     optimizer=optimizer,
+    #     num_warmup_steps=num_warmup_steps,
+    #     num_training_steps=args.max_train_steps,
+    #     lr_end=args.learning_rate * 0.01,  # End at 1% of initial LR
+    #     power=0.9
+    # )
+    rprint(f"\n{'='*70}")
+    rprint(f"[bold cyan]Learning Rate Schedule[/bold cyan]")
+    rprint(f"{'='*70}")
+    rprint(f"Scheduler type: {args.lr_scheduler_type}")
+    rprint(f"Total training steps: {args.max_train_steps:,}")
+    rprint(f"Warmup steps: {num_warmup_steps:,} ({num_warmup_steps/args.max_train_steps*100:.1f}%)")
+    rprint(f"Steps per epoch: {num_update_steps_per_epoch}")
+    rprint(f"{'='*70}\n")
 
     # Prepare everything with our `accelerator`.
     model, optimizer, train_dataloader, valid_dataloader, lr_scheduler = accelerator.prepare(
@@ -961,61 +1408,154 @@ def main():
     # ------------------------------------------------------------------------------------------------
 
     import wandb
-
     wandb_config = {
+        # Learning rate configuration
         "learning_rate": args.learning_rate,
-        "architecture": "Mask2Former (DINOv3 backbone)",  
-        "backbone": args.model,                           
+        "use_differential_lr": getattr(args, 'use_differential_lr', False),
+        "adapter_lr": args.learning_rate * getattr(args, 'adapter_lr_multiplier', 1.0),
+        "head_lr": args.learning_rate * getattr(args, 'head_lr_multiplier', 1.0),
+        "encoder_lr": args.learning_rate * getattr(args, 'encoder_lr_multiplier', 1.0),
+        "decoder_lr": args.learning_rate * getattr(args, 'decoder_lr_multiplier', 1.0),
+        "weight_decay": getattr(args, 'weight_decay', 0.05),
+        "max_grad_norm": getattr(args, 'max_grad_norm', 1.0),
+        
+        # Model architecture
+        "architecture": "Mask2Former (DINOv3 backbone)",
+        "backbone": args.model,
+        "freeze_backbone": getattr(args, 'freeze_backbone', True),
+        "freeze_adapter": getattr(args, 'freeze_adapter', False),
+        "freeze_encoder": getattr(args, 'freeze_encoder', False),
+        "use_improved_adapter": getattr(args, 'use_improved_adapter', True),
+        
+        # Data configuration
         "image_height": args.image_height,
         "image_width": args.image_width,
-        "dataset": args.dataset_name,                      # hub name or local path
+        "dataset": args.dataset_name,
+        "num_labels": getattr(args, 'num_labels', 12),
+        "do_reduce_labels": args.do_reduce_labels,
+        
+        # Training configuration
         "epochs": args.num_train_epochs,
         "batch_size_per_device": args.per_device_train_batch_size,
         "eval_batch_size": args.per_device_eval_batch_size,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "effective_batch_size": args.per_device_train_batch_size * args.gradient_accumulation_steps,
         "num_train_steps": args.max_train_steps,
-        "lr_scheduler_type": str(args.lr_scheduler_type),
+        
+        # Optimizer configuration
+        "optimizer": type(optimizer).__name__,
         "adam_beta1": args.adam_beta1,
         "adam_beta2": args.adam_beta2,
         "adam_epsilon": args.adam_epsilon,
-        "num_warmup_steps": args.num_warmup_steps,
+        
+        # Scheduler configuration
+        "lr_scheduler_type": str(args.lr_scheduler_type),
+        "num_warmup_steps": num_warmup_steps,
+        "warmup_ratio": num_warmup_steps / args.max_train_steps,
+        
+        # System configuration
         "num_workers": args.dataloader_num_workers,
         "seed": args.seed,
+        "device": str(accelerator.device),
+        "num_processes": accelerator.num_processes,
+        
+        # Checkpointing
         "output_dir": args.output_dir,
-        "optimizer": type(optimizer).__name__,             
-        "device": str(accelerator.device),               
         "checkpointing_steps": args.checkpointing_steps,
         "resume_from_checkpoint": args.resume_from_checkpoint,
-        "do_reduce_labels": args.do_reduce_labels,
+        "save_total_limit": getattr(args, 'save_total_limit', 3),
+        
+        # Hub configuration
         "push_to_hub": args.push_to_hub,
         "hub_model_id": args.hub_model_id,
         "cache_dir": args.cache_dir,
     }
 
+    rprint(f"\n{'='*70}")
+    rprint(f"[bold cyan]Wandb Configuration[/bold cyan]")
+    rprint(f"{'='*70}")
+    for key, value in list(wandb_config.items())[:10]:  # Show first 10
+        rprint(f"{key}: {value}")
+    rprint(f"... and {len(wandb_config)-10} more")
+    rprint(f"{'='*70}\n")
+
     rprint(f"args.lr_scheduler_type: {args.lr_scheduler_type}")
+    model_name = os.path.basename(args.model).replace('.py', '')
     run_name = (
-        f"{os.path.basename(args.model)}-"
-        f"Mask2Former-E{wandb_config['epochs']}-BS{wandb_config['batch_size_per_device']}-"
-        f"LR{wandb_config['learning_rate']}-{args.lr_scheduler_type}"
+        f"{model_name}-"
+        f"E{args.num_train_epochs}-"
+        f"BS{args.per_device_train_batch_size}x{args.gradient_accumulation_steps}-"
+        f"LR{args.learning_rate:.0e}-"
+        f"{str(args.lr_scheduler_type).replace('SchedulerType.', '')}"
     )
+    # Add differential LR tag if used
+    if getattr(args, 'use_differential_lr', False):
+        run_name += "-DiffLR"
+
+    rprint(f"[cyan]Wandb run name: {run_name}[/cyan]\n")
+
+    # run = wandb.init(
+    #     entity="albarham-chalmers",
+    #     project="Instance-segmentation-project",
+    #     name=run_name,
+    #     config=wandb_config,
+    #     tags = [
+    #         "instance-segmentation",
+    #         "Mask2Former",
+    #         "DINOv3",
+    #         f"{args.num_labels}-classes",
+    #         f"{args.image_height}x{args.image_width}",
+    #         str(accelerator.device).split(':')[0].upper(),  # MPS, CUDA, or CPU
+    #     ],
+    #     # save_code=True,
+    #     # id = "k7deh2da",
+    #     # resume='auto',
+    #     # allow_val_change=True
+    #             )
+
+    tags = [
+        "instance-segmentation",
+        "Mask2Former",
+        "DINOv3",
+        f"{args.num_labels}-classes",
+        f"{args.image_height}x{args.image_width}",
+        str(accelerator.device).split(':')[0].upper(),  # MPS, CUDA, or CPU
+    ]
+
+    # Add differential LR tag
+    if getattr(args, 'use_differential_lr', False):
+        tags.append("differential-lr")
+
+    # Add training stage
+    if args.resume_from_checkpoint:
+        tags.append("resumed")
+    else:
+        tags.append("from-scratch")
 
     run = wandb.init(
         entity="albarham-chalmers",
         project="Instance-segmentation-project",
         name=run_name,
         config=wandb_config,
-        tags=[
-            "segmentation",
-            "ViT",
-            "Mask2Former",
-            wandb_config["dataset"],
-            "GPU",
-            "safetensors",
-        ],
-        save_code=True,
+        tags=tags,
+        resume="allow",  # Allow resuming if run crashes
+        # OPTIONAL: Uncomment if you want to resume specific run
+        # id="your-run-id",
+        # resume="must",
     )
-
-
+    
+    if accelerator.is_main_process:
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        
+        wandb.log({
+            "model/total_params": total_params,
+            "model/trainable_params": trainable_params,
+            "model/trainable_percent": 100 * trainable_params / total_params,
+            "model/num_update_steps_per_epoch": num_update_steps_per_epoch,
+        }, step=0)
+        
+        rprint(f"\n[green]✓ Wandb initialized: {run.url}[/green]\n")
 
     # ------------------------------------------------------------------------------------------------
     # Run training with evaluation on each epoch
