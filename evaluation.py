@@ -35,30 +35,42 @@ import matplotlib.pyplot as plt
 logger = logging.getLogger(__name__)
 
 def plot_pr_curves(pr_curves, id2label=None, out_dir="pr_curves", iou_label="IoU=0.50"):
-    os.makedirs(out_dir, exist_ok=True)
-    num_classes = max(pr_curves.keys()) + 1
-    cols = 4
-    rows = (num_classes + cols - 1) // cols
+    import matplotlib.pyplot as plt
+    import os
 
-    # One plot for each class
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Define class keys to plot (skip 1 and 7, add '3+7')
+    base_keys = [k for k in pr_curves.keys() 
+                if isinstance(k, int) and k not in [0, 1, 3, 7,4]]  # skip background, Driveway, Bicyclist, Bicycle
+    if "3+7" in pr_curves:
+        plot_keys = base_keys + ["3+7"]
+    else:
+        plot_keys = base_keys
+
+
+    cols = 4
+    rows = (len(plot_keys) + cols - 1) // cols
     fig, axs = plt.subplots(rows, cols, figsize=(cols*5, rows*4))
     axs = axs.flatten()
-    for c, d in pr_curves.items():
-        scores, precisions, recalls = d['scores'], d['precision'], d['recall']
-        label = id2label[c] if id2label and c in id2label else f"Class {c}"
-        axs[c-1].plot(recalls, precisions, marker=".", label=label)
-        axs[c-1].set_title(f"{label}")
-        axs[c-1].set_xlabel("Recall")
-        axs[c-1].set_ylabel("Precision")
-        axs[c-1].set_xlim([0,1])
-        axs[c-1].set_ylim([0,1])
-        axs[c-1].grid(True)
-        axs[c-1].legend()
-    # Hide unused subplots
-    for ax in axs[num_classes-1:]:
+
+    special_labels = { "3+7": "Bicycle+Bicyclist" }
+    for i, c in enumerate(plot_keys):
+        curve = pr_curves[c]
+        scores, precisions, recalls = curve['scores'], curve['precision'], curve['recall']
+        label = special_labels.get(c, id2label.get(c, f"Class {c}") if id2label else f"Class {c}")
+        axs[i].plot(recalls, precisions, marker=".", label=label)
+        axs[i].set_title(f"{label}")
+        axs[i].set_xlabel("Recall")
+        axs[i].set_ylabel("Precision")
+        axs[i].set_xlim([0,1])
+        axs[i].set_ylim([0,1])
+        axs[i].grid(True)
+        axs[i].legend()
+    for ax in axs[len(plot_keys):]:
         ax.axis('off')
 
-    plt.suptitle(f"Per-class Precision-Recall Curves ({iou_label})")
+    # plt.suptitle(f"Per-class Precision-Recall Curves ({iou_label})")
     plt.tight_layout(rect=[0, 0, 1, 0.97])
     out_path = os.path.join(out_dir, f"pr_curves_{iou_label.replace('=','').replace('.','')}.png")
     plt.savefig(out_path)
@@ -362,11 +374,29 @@ def evaluation_loop(model, image_processor, accelerator: Accelerator, dataloader
 
             # Accumulate data for PR curves (store CPU masks)
             img_id = global_img_id
-            # Predictions per class
             for c in range(num_classes):
-                if c == 0:  # ignore background class for PR
-                    continue
-                if pred_labels.numel():
+                if c == 0: continue  # ignore background
+                if c == 1: continue  # skip "Driveway"
+
+                # MERGE Bicyclist (3) and Bicycle (7) as "3+7"
+                if c == 3:
+                    merged_c = "3+7"
+                    sel3 = (pred_labels == 3).nonzero(as_tuple=True)[0]
+                    sel7 = (pred_labels == 7).nonzero(as_tuple=True)[0]
+                    for k in sel3.tolist() + sel7.tolist():
+                        preds_by_class[merged_c][img_id].append((
+                            float(pred_scores[k].item()),
+                            pred_masks[k].detach().to("cpu")
+                        ))
+                    sel_gt3 = (target_labels == 3).nonzero(as_tuple=True)[0]
+                    sel_gt7 = (target_labels == 7).nonzero(as_tuple=True)[0]
+                    for k in sel_gt3.tolist() + sel_gt7.tolist():
+                        gts_by_class[merged_c][img_id].append(
+                            target_masks[k].detach().to("cpu")
+                        )
+                elif c == 7:
+                    continue  # skip (it's merged above)
+                else:
                     sel = (pred_labels == c).nonzero(as_tuple=True)[0]
                     if sel.numel():
                         for k in sel.tolist():
@@ -374,8 +404,6 @@ def evaluation_loop(model, image_processor, accelerator: Accelerator, dataloader
                                 float(pred_scores[k].item()),
                                 pred_masks[k].detach().to("cpu")
                             ))
-                # Ground truths per class
-                if target_labels.numel():
                     sel_gt = (target_labels == c).nonzero(as_tuple=True)[0]
                     if sel_gt.numel():
                         for k in sel_gt.tolist():
@@ -453,7 +481,14 @@ def evaluation_loop(model, image_processor, accelerator: Accelerator, dataloader
 
     pr_curves_iou50 = {}
     pr_curves_iou75 = {}
-    for c in range(num_classes):
+
+    special_classes = list(range(num_classes))
+    special_classes.remove(1)   # skip "Driveway"
+    special_classes.remove(7)   # skip "Bicycle" - merged with 3
+    special_classes.append("3+7")  # merged class at the end
+
+    for c in special_classes:
+        # If using id2label, you can set the label appropriately
         if c == 0:
             continue  # skip background
         s50, p50, r50 = pr_curve_for_class(c, iou_thr=0.50)
@@ -484,8 +519,8 @@ def main():
     do_reduce_labels = True
     hub_token = None
     num_labels = 12  # set to number of "thing" classes + background in your setup
-    per_device_eval_batch_size = 20
-    dataloader_num_workers = 20
+    per_device_eval_batch_size = 16
+    dataloader_num_workers = 16
 
     # -------------------------------
     # Accelerator

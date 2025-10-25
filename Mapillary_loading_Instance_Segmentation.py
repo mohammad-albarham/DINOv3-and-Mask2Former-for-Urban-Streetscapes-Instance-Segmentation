@@ -35,7 +35,7 @@ class MapillaryInstanceDataset(Dataset):
         self.transforms = transforms
         
         # Load config file to get label information
-        config_path = os.path.join(root_dir, f'config_{version}.json')
+        config_path = os.path.join(root_dir, 'config_v2.0_testing.json')
         with open(config_path, 'r') as f:
             config = json.load(f)
         
@@ -61,7 +61,7 @@ class MapillaryInstanceDataset(Dataset):
         self.image_files = sorted(glob.glob(os.path.join(images_dir, '*.jpg')))
         self.image_ids = [os.path.splitext(os.path.basename(f))[0] for f in self.image_files]
 
-        self.image_ids = ['--BJs76vloEaiH-wppzWNA']
+        self.image_ids = ['2DPJuTp0mSTXXGEsWRL25g']
 
         print(f"Loaded {len(self.image_ids)} images from {split} split")
         print(f"Number of thing classes (with instances): {len(self.thing_classes)}")

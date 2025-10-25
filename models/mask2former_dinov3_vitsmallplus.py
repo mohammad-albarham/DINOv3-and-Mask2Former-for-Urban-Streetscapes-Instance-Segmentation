@@ -80,8 +80,6 @@ class ImprovedAdapter(nn.Module):
             return fused
         
         return adapted
-
-
 class SEBlock(nn.Module):
     """Squeeze-and-Excitation block for channel attention"""
     
@@ -100,7 +98,6 @@ class SEBlock(nn.Module):
         y = self.squeeze(x).view(b, c)
         y = self.excitation(y).view(b, c, 1, 1)
         return x * y.expand_as(x)
-
 
 # ============================================================================
 # ENHANCEMENT 2: Better Layer Selection Strategy for DINOv3
@@ -195,7 +192,6 @@ class DinoV3WithAdapterBackbone(nn.Module):
         # Return features with proper naming for Mask2Former
         return {name: feat for name, feat in zip(self.out_features, adapted_features)}
 
-
 # ============================================================================
 # ENHANCEMENT 3: Original Adapter (for backward compatibility)
 # ============================================================================
@@ -216,7 +212,6 @@ class Adapter(nn.Module):
 # ============================================================================
 # ENHANCEMENT 4: Main Model with Improvements
 # ============================================================================
-
 class Mask2Former_Dinov3(nn.Module, PyTorchModelHubMixin):
     """
     Enhanced Mask2Former with DINOv3 backbone
@@ -226,6 +221,7 @@ class Mask2Former_Dinov3(nn.Module, PyTorchModelHubMixin):
     2. Improved adapter with feature fusion and attention
     3. Training-friendly configurations
     4. Gradient checkpointing support for memory efficiency
+    5. Optimized parameter freezing for fast convergence
     """
     
     def __init__(
@@ -236,7 +232,9 @@ class Mask2Former_Dinov3(nn.Module, PyTorchModelHubMixin):
         expected_channels: List[int] = [96, 192, 384, 768],
         freeze_backbone: bool = True,
         use_improved_adapter: bool = True,
-        freeze_adapter: bool = False,  # NEW: Option to fine-tune adapter
+        freeze_adapter: bool = True,  # CHANGED: Default to True for speed
+        freeze_pixel_level: bool = True,  # NEW: Freeze pixel-level module
+        freeze_encoder: bool = True,  # NEW: Freeze transformer encoder
         use_gradient_checkpointing: bool = False,
         hub_token: Optional[str] = None,
     ):
@@ -248,7 +246,9 @@ class Mask2Former_Dinov3(nn.Module, PyTorchModelHubMixin):
             expected_channels: Output channels for multi-scale features
             freeze_backbone: Whether to freeze DINOv3 backbone
             use_improved_adapter: Use enhanced adapter with fusion and attention
-            freeze_adapter: Whether to freeze the channel adapter
+            freeze_adapter: Whether to freeze the channel adapter (recommended: True)
+            freeze_pixel_level: Whether to freeze pixel-level module (recommended: True)
+            freeze_encoder: Whether to freeze transformer encoder (recommended: True)
             use_gradient_checkpointing: Enable gradient checkpointing for memory savings
             hub_token: HuggingFace token for private models
         """
@@ -265,6 +265,9 @@ class Mask2Former_Dinov3(nn.Module, PyTorchModelHubMixin):
         self.expected_channels = expected_channels
         self.freeze_backbone = freeze_backbone
         self.use_improved_adapter = use_improved_adapter
+        self.freeze_adapter = freeze_adapter
+        self.freeze_pixel_level = freeze_pixel_level
+        self.freeze_encoder = freeze_encoder
         self.hub_token = hub_token
         
         # Use semantic segmentation base for instance segmentation
@@ -291,19 +294,49 @@ class Mask2Former_Dinov3(nn.Module, PyTorchModelHubMixin):
         )
         model.model.backbone = custom_backbone
         
-        # Freeze DINOv3 backbone
+        # =====================================================================
+        # PARAMETER FREEZING STRATEGY (Optimized for Fast Training)
+        # =====================================================================
+        
+        # 1. Freeze DINOv3 backbone
         if freeze_backbone:
             for param in model.model.backbone.model.parameters():
                 param.requires_grad = False
-            rprint("[green]✓[/green] Frozen DINOv3 backbone")
+            rprint("[green]✓[/green] Frozen DINOv3 backbone (21.6M params)")
         
-        # Optionally freeze adapter
+        # 2. Freeze channel adapter
         if freeze_adapter:
             for param in model.model.backbone.adapter.parameters():
                 param.requires_grad = False
-            rprint("[green]✓[/green] Frozen channel adapter")
+            rprint("[green]✓[/green] Frozen channel adapter (5.9M params)")
         else:
-            rprint("[yellow]⚡[/yellow] Adapter is trainable (recommended for quick adaptation)")
+            rprint("[yellow]⚡[/yellow] Adapter is trainable (5.9M params)")
+        
+        # 3. CRITICAL: Freeze pixel-level module (saves ~40-50M params)
+        if freeze_pixel_level and hasattr(model.model, 'pixel_level_module'):
+            for param in model.model.pixel_level_module.parameters():
+                param.requires_grad = False
+            pixel_params = sum(p.numel() for p in model.model.pixel_level_module.parameters())
+            rprint(f"[green]✓[/green] Frozen pixel-level module ({pixel_params/1e6:.1f}M params)")
+        
+        # 4. CRITICAL: Freeze transformer encoder (saves ~100-120M params)
+        if freeze_encoder and hasattr(model.model, 'transformer_module'):
+            frozen_encoder_params = 0
+            for name, param in model.model.transformer_module.named_parameters():
+                # Freeze encoder layers but keep decoder trainable
+                if 'encoder' in name or 'level_embed' in name or 'input_proj' in name:
+                    param.requires_grad = False
+                    frozen_encoder_params += param.numel()
+            rprint(f"[green]✓[/green] Frozen transformer encoder ({frozen_encoder_params/1e6:.1f}M params)")
+        
+        # 5. Optional: Freeze some decoder layers (uncomment for even faster training)
+        # if hasattr(model.model, 'transformer_module'):
+        #     num_decoder_layers = len(model.model.transformer_module.decoder.layers)
+        #     layers_to_freeze = num_decoder_layers // 2  # Freeze first half
+        #     for i in range(layers_to_freeze):
+        #         for param in model.model.transformer_module.decoder.layers[i].parameters():
+        #             param.requires_grad = False
+        #     rprint(f"[green]✓[/green] Frozen first {layers_to_freeze} decoder layers")
         
         # Enable gradient checkpointing if requested
         if use_gradient_checkpointing:
@@ -324,6 +357,19 @@ class Mask2Former_Dinov3(nn.Module, PyTorchModelHubMixin):
         
         # Report statistics
         self._print_model_statistics()
+        
+        # Verify trainable percentage
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        percentage = 100 * trainable_params / total_params
+        
+        if percentage > 25:
+            rprint(f"\n[bold red]⚠️  WARNING: {percentage:.1f}% parameters trainable[/bold red]")
+            rprint("[bold red]This may be too slow for training by tomorrow![/bold red]")
+            rprint("[yellow]Consider setting freeze_pixel_level=True and freeze_encoder=True[/yellow]")
+        else:
+            rprint(f"\n[bold green]✓ Optimized: {percentage:.1f}% parameters trainable[/bold green]")
+
     
     def _print_model_statistics(self):
         """Print detailed model statistics"""

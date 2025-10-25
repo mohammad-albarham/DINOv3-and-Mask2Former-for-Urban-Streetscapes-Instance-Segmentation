@@ -24,92 +24,8 @@ pretty.install()
 
 from models.mask2former_dinov3_vitsmallplus import Mask2Former_Dinov3
 
+from rich import print as rprint
 
-
-# Class ID to name mapping
-# CLASS_NAMES = {
-#     0: "bead 1",
-#     1: "bead 2",
-#     2: "bead 3",
-#     3: "bead 4",
-#     4: "bead 5",
-#     5: "bead 6",
-#     6: "bead 7",
-#     7: "bead 8"
-# # }
-# CLASS_NAMES ={
-#     0: "Bird",
-#     1: "Ground Animal",
-#     2: "Temporary Barrier",
-#     3: "Crosswalk - Plain",
-#     4: "Driveway",
-#     5: "Person",
-#     6: "Bicyclist",
-#     7: "Motorcyclist",
-#     8: "Other Rider",
-#     9: "Lane Marking - Arrow (Left)",
-#     10: "Lane Marking - Arrow (Other)",
-#     11: "Lane Marking - Arrow (Right)",
-#     12: "Lane Marking - Arrow (Split Left or Straight)",
-#     13: "Lane Marking - Arrow (Split Right or Straight)",
-#     14: "Lane Marking - Arrow (Straight)",
-#     15: "Lane Marking - Crosswalk",
-#     16: "Lane Marking - Give Way (Row)",
-#     17: "Lane Marking - Give Way (Single)",
-#     18: "Lane Marking - Other",
-#     19: "Lane Marking - Stop Line",
-#     20: "Lane Marking - Symbol (Bicycle)",
-#     21: "Lane Marking - Symbol (Other)",
-#     22: "Lane Marking - Text",
-#     23: "Banner",
-#     24: "Bench",
-#     25: "Bike Rack",
-#     26: "Catch Basin",
-#     27: "CCTV Camera",
-#     28: "Fire Hydrant",
-#     29: "Junction Box",
-#     30: "Mailbox",
-#     31: "Manhole",
-#     32: "Parking Meter",
-#     33: "Phone Booth",
-#     34: "Signage - Advertisement",
-#     35: "Signage - Ambiguous",
-#     36: "Signage - Back",
-#     37: "Signage - Information",
-#     38: "Signage - Other",
-#     39: "Signage - Store",
-#     40: "Street Light",
-#     41: "Pole",
-#     42: "Traffic Sign Frame",
-#     43: "Utility Pole",
-#     44: "Traffic Cone",
-#     45: "Traffic Light - General (Single)",
-#     46: "Traffic Light - Pedestrians",
-#     47: "Traffic Light - General (Upright)",
-#     48: "Traffic Light - General (Horizontal)",
-#     49: "Traffic Light - Cyclists",
-#     50: "Traffic Light - Other",
-#     51: "Traffic Sign - Ambiguous",
-#     52: "Traffic Sign (Back)",
-#     53: "Traffic Sign - Direction (Back)",
-#     54: "Traffic Sign - Direction (Front)",
-#     55: "Traffic Sign (Front)",
-#     56: "Traffic Sign - Parking",
-#     57: "Traffic Sign - Temporary (Back)",
-#     58: "Traffic Sign - Temporary (Front)",
-#     59: "Trash Can",
-#     60: "Bicycle",
-#     61: "Boat",
-#     62: "Bus",
-#     63: "Car",
-#     64: "Caravan",
-#     65: "Motorcycle",
-#     66: "On Rails",
-#     67: "Other Vehicle",
-#     68: "Trailer",
-#     69: "Truck",
-#     70: "Wheeled Slow",
-#     71: "Water Valve"}
 
 import os
 import requests
@@ -132,6 +48,8 @@ def load_model(model_path):
     print(f"Loading model: {model_path}")
     
     image_processor = AutoImageProcessor.from_pretrained(model_path, use_fast=True)
+    
+    rprint(f"image_processor: {image_processor}")
     # model = AutoModelForUniversalSegmentation.from_pretrained(model_path)
 
 
@@ -152,7 +70,7 @@ def load_model(model_path):
 
     state_dict = load_file("/Users/pain/Desktop/Chalmers_University_of_Technlogy/Courses/third_semster/SP5/SSY340/Project/Test_Dinov3/output/dinov3-smallplus-mask2former-1e4-unfreeze-1000_samples/best_model/model.safetensors")
 
-    from rich import print as rprint
+    
     # rprint(f"state_dict: {state_dict.inner_model.model.}")
     from transformers import AutoConfig
 
@@ -303,7 +221,7 @@ def inference_and_visualize(model, image_processor, image_path, save_path='None'
             class_name = CLASS_NAMES.get(class_id, f"class_{class_id}")
             confidence = segment_info['score']
             color = colors[class_id % len(colors)]
-            text = f"{class_name}: {confidence:.2f}"
+            text = f"{class_name}, {class_id}: {confidence:.2f}"
 
             # Find centroid of mask
             mask = (segmentation == segment_info["id"])
@@ -401,14 +319,16 @@ def process_directory(model, image_processor, input_dir, output_dir, threshold=0
 def main():
     parser = argparse.ArgumentParser(description="Simple Mask2Former Inference")
     parser.add_argument("--model_path", "-m", help="Path to model", 
-                        default="/Users/pain/Desktop/Chalmers_University_of_Technlogy/Courses/third_semster/SP5/SSY340/Project/Test_Dinov3/output_new_5000/dinov3-smallplus-mask2former-1e4-unfreeze-1000_samples/step_6400_model")
+                        #default="/Users/pain/Desktop/Chalmers_University_of_Technlogy/Courses/third_semster/SP5/SSY340/Project/Test_Dinov3/output_final_overfit_12_classes/dinov3-smallplus-mask2former/epoch_919"
+                        default= "/Users/pain/Desktop/Chalmers_University_of_Technlogy/Courses/third_semster/SP5/SSY340/Project/Test_Dinov3/output_final_fixed_evaluation_12_classes_enhance_model/dinov3-smallplus-mask2former-v1.0-3000_samples-12-classes-enhanced/best_model"
+                        )
     parser.add_argument("--image_path", "-i", help="Path to single image",
                         default="/Users/pain/Desktop/Chalmers_University_of_Technlogy/Courses/third_semster/SP5/SSY340/Project/Test_Dinov3/mapillary_dataset/training/images/__IoBfs3I6vB5ND-vqXK1A.jpg")
     parser.add_argument("--input_dir", "-d", help="Input directory (for batch processing)", 
-                        default="/Users/pain/Desktop/Chalmers_University_of_Technlogy/Courses/third_semster/SP5/SSY340/Project/Test_Dinov3/test_inference"
+                        default="/Users/pain/Desktop/Chalmers_University_of_Technlogy/Courses/third_semster/SP5/SSY340/Project/Test_Dinov3/Poster_test_images"
                         )
     parser.add_argument("--output_dir", "-od", help="Output directory (for batch processing)", 
-                        default="/Users/pain/Desktop/Chalmers_University_of_Technlogy/Courses/third_semster/SP5/SSY340/Project/Test_Dinov3/results_temp")
+                        default="/Users/pain/Desktop/Chalmers_University_of_Technlogy/Courses/third_semster/SP5/SSY340/Project/Test_Dinov3/Poster_test_images_results")
     parser.add_argument("--output", "-o", help="Output path for single image result", 
                         default='output.png')
     parser.add_argument("--threshold", "-t", type=float, default=0.5, help="Detection threshold (default: 0.5)")
