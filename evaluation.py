@@ -34,6 +34,18 @@ import matplotlib.pyplot as plt
 
 logger = logging.getLogger(__name__)
 
+def compute_pixel_accuracy(pred_class_map, tgt_class_map, ignore_index=0):
+    # Flatten and mask ignored areas (like background, if needed)
+    pred_flat = pred_class_map.view(-1)
+    tgt_flat = tgt_class_map.view(-1)
+    mask = tgt_flat != ignore_index  # Ignore background pixels
+    if mask.sum() == 0:
+        return 1.0  # No valid pixels, return perfect accuracy
+    correct = (pred_flat[mask] == tgt_flat[mask]).sum().item()
+    total = mask.sum().item()
+    return correct / total
+
+
 def plot_pr_curves(pr_curves, id2label=None, out_dir="pr_curves", iou_label="IoU=0.50"):
     import matplotlib.pyplot as plt
     import os
@@ -138,7 +150,7 @@ class MapillaryInstanceDataset(Dataset):
         self.image_files = sorted(glob.glob(os.path.join(images_dir, '*.jpg')))
         self.image_ids = [os.path.splitext(os.path.basename(f))[0] for f in self.image_files]
 
-        N_val = 300
+        N_val = 10
         self.image_ids = self.image_ids[:N_val]
         self.image_files = self.image_files[:N_val]
 
@@ -274,8 +286,8 @@ from collections import defaultdict
 @torch.inference_mode()
 def evaluation_loop(model, image_processor, accelerator: Accelerator, dataloader, id2label=None, num_classes: int = 12):
     """
-    Instance mAP (iou_type='segm'), semantic mIoU, and per-class Precision–Recall curves (IoU sweep).
-    Returns a dict with mAP results, mIoU, per_class_iou, and PR curves at IoU=0.50 and IoU=0.75.
+    Instance mAP (iou_type='segm'), semantic mIoU, per-class PR curves, and mean pixel accuracy.
+    Returns a dict with mAP results, mIoU, per_class_iou, PR curves, and pixel accuracy.
     """
     device = accelerator.device
 
@@ -287,16 +299,14 @@ def evaluation_loop(model, image_processor, accelerator: Accelerator, dataloader
     jaccard = JaccardIndex(task="multiclass", num_classes=num_classes, ignore_index=0, average=None).to(device)
 
     # Storage to build PR curves (per-class, per-image)
-    # preds_by_class[c][img_id] = list of (score, mask_bool_cpu)
-    # gts_by_class[c][img_id]   = list of (mask_bool_cpu)
     preds_by_class = defaultdict(lambda: defaultdict(list))
     gts_by_class   = defaultdict(lambda: defaultdict(list))
+    pixel_accuracies = []  # <<< NEW
 
     model.eval()
     global_img_id = 0
     for inputs in tqdm(dataloader, total=len(dataloader), disable=not accelerator.is_local_main_process):
         original_sizes = inputs.pop("original_sizes", None)
-
         model_inputs = {"pixel_values": inputs["pixel_values"].to(device)}
         if "pixel_mask" in inputs:
             model_inputs["pixel_mask"] = inputs["pixel_mask"].to(device)
@@ -371,13 +381,16 @@ def evaluation_loop(model, image_processor, accelerator: Accelerator, dataloader
 
             # Update mIoU per image
             jaccard.update(pred_class_map.unsqueeze(0), tgt_class_map.unsqueeze(0))
+            
+            # NEW --- Pixel accuracy calculation per image
+            acc = compute_pixel_accuracy(pred_class_map, tgt_class_map, ignore_index=0)
+            pixel_accuracies.append(acc)
 
-            # Accumulate data for PR curves (store CPU masks)
+            # PR curve data storage
             img_id = global_img_id
             for c in range(num_classes):
                 if c == 0: continue  # ignore background
                 if c == 1: continue  # skip "Driveway"
-
                 # MERGE Bicyclist (3) and Bicycle (7) as "3+7"
                 if c == 3:
                     merged_c = "3+7"
@@ -420,6 +433,7 @@ def evaluation_loop(model, image_processor, accelerator: Accelerator, dataloader
     map_results = metric_map.compute()
     per_class_iou = jaccard.compute()
     miou = torch.nanmean(per_class_iou)
+    mean_pixel_accuracy = np.mean(pixel_accuracies)  # <<< NEW AGGREGATION
 
     # ---- Build PR curves per class at fixed IoU thresholds ----
     def mask_iou(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -428,21 +442,16 @@ def evaluation_loop(model, image_processor, accelerator: Accelerator, dataloader
         return (inter / union) if union > 0 else 0.0
 
     def pr_curve_for_class(c: int, iou_thr: float):
-        # Aggregate predictions across images with TP/FP assignment per image
-        records = []  # list of (score, is_tp)
+        records = []
         total_gt = 0
-        # Iterate each image independently for matching
         all_imgs = set(list(preds_by_class[c].keys()) + list(gts_by_class[c].keys()))
         for img_id in all_imgs:
             preds = preds_by_class[c].get(img_id, [])
             gts   = gts_by_class[c].get(img_id, [])
             total_gt += len(gts)
-            # Track matched GTs
             matched = [False] * len(gts)
-            # Sort preds by score desc within image
             preds_sorted = sorted(preds, key=lambda x: x[0], reverse=True)
             for score, pmask in preds_sorted:
-                # Find best IoU gt
                 best_iou, best_j = 0.0, -1
                 for j, gmask in enumerate(gts):
                     if not matched[j]:
@@ -455,8 +464,7 @@ def evaluation_loop(model, image_processor, accelerator: Accelerator, dataloader
                 else:
                     records.append((score, 0))
         if len(records) == 0:
-            return [], [], []  # no predictions
-        # Global sort by score desc across images
+            return [], [], []
         records.sort(key=lambda x: x[0], reverse=True)
         scores = [r[0] for r in records]
         tps = []
@@ -488,7 +496,6 @@ def evaluation_loop(model, image_processor, accelerator: Accelerator, dataloader
     special_classes.append("3+7")  # merged class at the end
 
     for c in special_classes:
-        # If using id2label, you can set the label appropriately
         if c == 0:
             continue  # skip background
         s50, p50, r50 = pr_curve_for_class(c, iou_thr=0.50)
@@ -502,6 +509,8 @@ def evaluation_loop(model, image_processor, accelerator: Accelerator, dataloader
     combined["per_class_iou"] = per_class_iou.detach().cpu().tolist()
     combined["pr_curves_iou50"] = pr_curves_iou50
     combined["pr_curves_iou75"] = pr_curves_iou75
+    combined["pixel_accuracy"] = float(mean_pixel_accuracy)  # <<< NEW METRIC
+
     return combined
 
 
