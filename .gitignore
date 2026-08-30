@@ -18,6 +18,12 @@ mapillary_dataset/*
 mapillary_dataset copy/*
 global-streetscapes/*
 wandb/*
+output/*
+output_init/*
+output_new/*
+output_new_5000/*
+output_new_only_image_features/*
+output_new_overfit/*
 
 # logs 
 
@@ -29,3 +35,13 @@ wandb/*
 *.csv
 settings.json
 *lock
+*.pth
+*pt
+*.safetensors
+*.lock
+*.json
+*.jpeg
+*.jpg
+*ttf
+image_files.txt
+*.pth
