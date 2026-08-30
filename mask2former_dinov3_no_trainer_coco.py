@@ -546,7 +546,7 @@ def evaluation_loop(model, image_processor, accelerator: Accelerator, dataloader
             if target_masks.shape[-2:] != tuple(target_size):
                 # Upsample all masks [N, H, W] to [N, target_H, target_W]
                 target_masks = F.interpolate(
-                    target_masks.float().unsqueeze(0), size=tuple(target_size), mode='nearest'
+                    target_masks.float().unsqueeze(0), size=tuple(target_size), mode='bilinear'
                 )[0].bool()
 
 

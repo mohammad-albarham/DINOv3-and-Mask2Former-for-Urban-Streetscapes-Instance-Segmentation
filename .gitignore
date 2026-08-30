@@ -44,4 +44,5 @@ settings.json
 *.jpg
 *ttf
 image_files.txt
+image_files_valid.txt
 *.pth

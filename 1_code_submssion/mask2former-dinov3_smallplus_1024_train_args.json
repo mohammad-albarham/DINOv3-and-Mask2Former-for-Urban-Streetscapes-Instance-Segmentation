@@ -1,0 +1,60 @@
+{
+  "model": "models/mask2former_dinov3_vitsmallplus.py",
+  "dataset_name": "./mapillary_dataset",
+  "output_dir": "output_optimized_differential_lr_12_classes/dinov3-smallplus-mask2former-v1.0-3000_samples-12-classes-enhanced-diff-lr",
+
+  "do_reduce_labels": true,
+  "image_height": 512,
+  "image_width": 512,
+
+  "num_train_epochs": 25,
+  "learning_rate": 0.0001,
+  "weight_decay": 0.05,
+  "max_grad_norm": 1.0,
+
+  "lr_scheduler_type": "cosine",
+  "warmup_ratio": 0.05,
+
+  "per_device_train_batch_size": 4,
+  "per_device_eval_batch_size": 4,
+  "gradient_accumulation_steps": 4,
+
+  "dataloader_num_workers": 4,
+  "dataloader_prefetch_factor": 2,
+  "dataloader_pin_memory": false,
+
+  "use_differential_lr": true,
+  "adapter_lr_multiplier": 10.0,
+  "head_lr_multiplier": 5.0,
+  "encoder_lr_multiplier": 2.0,
+  "decoder_lr_multiplier": 1.0,
+
+  "evaluation_strategy": "steps",
+  "eval_steps": 200,
+  "save_strategy": "steps",
+  "save_steps": 200,
+  "save_total_limit": 3,
+  "load_best_model_at_end": true,
+  "metric_for_best_model": "eval_map",
+
+  "logging_steps": 50,
+  "report_to": "wandb",
+
+  "checkpointing_steps": "200",
+  "push_to_hub": true,
+  "hub_strategy": "every_save",
+
+  "seed": 42,
+  "num_labels": 12,
+
+  "freeze_backbone": true,
+  "freeze_adapter": false,
+  "freeze_pixel_level": true,
+  "freeze_encoder": false,
+  "use_improved_adapter": true,
+  "use_gradient_checkpointing": false,
+
+  "adam_beta1": 0.9,
+  "adam_beta2": 0.999,
+  "adam_epsilon": 1e-8
+}

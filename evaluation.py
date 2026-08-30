@@ -8,6 +8,7 @@ from typing import Any, Mapping, List, Tuple, Dict
 
 import numpy as np
 from PIL import Image
+import gc
 
 import torch
 import torch.nn.functional as F
@@ -30,20 +31,35 @@ from rich import print as rprint
 from rich import print_json
 import os
 import matplotlib.pyplot as plt
-
+import json
 
 logger = logging.getLogger(__name__)
 
-def compute_pixel_accuracy(pred_class_map, tgt_class_map, ignore_index=0):
-    # Flatten and mask ignored areas (like background, if needed)
+def compute_pixel_accuracy(pred_class_map, tgt_class_map, ignore_index=None):
     pred_flat = pred_class_map.view(-1)
     tgt_flat = tgt_class_map.view(-1)
-    mask = tgt_flat != ignore_index  # Ignore background pixels
+    if ignore_index is not None:
+        mask = tgt_flat != ignore_index
+    else:
+        mask = torch.ones_like(tgt_flat, dtype=torch.bool)  # All True tensor
     if mask.sum() == 0:
-        return 1.0  # No valid pixels, return perfect accuracy
+        return 1.0
     correct = (pred_flat[mask] == tgt_flat[mask]).sum().item()
     total = mask.sum().item()
     return correct / total
+
+def make_serializable(metrics):
+    def convert(x):
+        if isinstance(x, torch.Tensor):
+            return x.tolist()
+        if isinstance(x, float) or isinstance(x, int) or isinstance(x, str):
+            return x
+        if isinstance(x, dict):
+            return {k: convert(v) for k, v in x.items()}
+        if isinstance(x, list):
+            return [convert(v) for v in x]
+        return x
+    return convert(metrics)
 
 
 def plot_pr_curves(pr_curves, id2label=None, out_dir="pr_curves", iou_label="IoU=0.50"):
@@ -61,7 +77,7 @@ def plot_pr_curves(pr_curves, id2label=None, out_dir="pr_curves", iou_label="IoU
         plot_keys = base_keys
 
 
-    cols = 4
+    cols = 2
     rows = (len(plot_keys) + cols - 1) // cols
     fig, axs = plt.subplots(rows, cols, figsize=(cols*5, rows*4))
     axs = axs.flatten()
@@ -150,7 +166,7 @@ class MapillaryInstanceDataset(Dataset):
         self.image_files = sorted(glob.glob(os.path.join(images_dir, '*.jpg')))
         self.image_ids = [os.path.splitext(os.path.basename(f))[0] for f in self.image_files]
 
-        N_val = 10
+        N_val = 300
         self.image_ids = self.image_ids[:N_val]
         self.image_files = self.image_files[:N_val]
 
@@ -294,9 +310,9 @@ def evaluation_loop(model, image_processor, accelerator: Accelerator, dataloader
     # Instance mAP metric
     metric_map = MeanAveragePrecision(iou_type="segm", class_metrics=True).to(device)
 
-    # Semantic mIoU metric (background=0 ignored)
-    from torchmetrics import JaccardIndex
-    jaccard = JaccardIndex(task="multiclass", num_classes=num_classes, ignore_index=0, average=None).to(device)
+    # # Semantic mIoU metric (background=0 ignored)
+    # from torchmetrics import JaccardIndex
+    # jaccard = JaccardIndex(task="multiclass", num_classes=num_classes, average=None).to(device)
 
     # Storage to build PR curves (per-class, per-image)
     preds_by_class = defaultdict(lambda: defaultdict(list))
@@ -358,7 +374,7 @@ def evaluation_loop(model, image_processor, accelerator: Accelerator, dataloader
                 raise ValueError(f"mask_labels must be [M,H,W], got {tuple(target_masks.shape)}")
             target_masks = target_masks.to(device=device, dtype=torch.float32)
             if target_masks.shape[-2:] != (th, tw):
-                target_masks = F.interpolate(target_masks.unsqueeze(0), size=(th, tw), mode="nearest")[0]
+                target_masks = F.interpolate(target_masks.unsqueeze(0), size=(th, tw), mode="bilinear")[0]
             target_masks = target_masks.to(dtype=torch.bool)
             target_labels = inputs["class_labels"][idx].to(device=device, dtype=torch.long)
             post_processed_targets.append({"masks": target_masks, "labels": target_labels})
@@ -379,11 +395,11 @@ def evaluation_loop(model, image_processor, accelerator: Accelerator, dataloader
                     chosen = pred_labels[argmax_idx[covered]].clamp_max(num_classes - 1)
                     pred_class_map[covered] = chosen
 
-            # Update mIoU per image
-            jaccard.update(pred_class_map.unsqueeze(0), tgt_class_map.unsqueeze(0))
+            # # Update mIoU per image
+            # jaccard.update(pred_class_map.unsqueeze(0), tgt_class_map.unsqueeze(0))
             
             # NEW --- Pixel accuracy calculation per image
-            acc = compute_pixel_accuracy(pred_class_map, tgt_class_map, ignore_index=0)
+            acc = compute_pixel_accuracy(pred_class_map, tgt_class_map)
             pixel_accuracies.append(acc)
 
             # PR curve data storage
@@ -428,11 +444,15 @@ def evaluation_loop(model, image_processor, accelerator: Accelerator, dataloader
 
         # Update instance mAP per batch
         metric_map.update(post_processed_predictions, post_processed_targets)
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        gc.collect()
+
 
     # Final metrics
     map_results = metric_map.compute()
-    per_class_iou = jaccard.compute()
-    miou = torch.nanmean(per_class_iou)
+    # per_class_iou = jaccard.compute()
+    # miou = torch.nanmean(per_class_iou)
     mean_pixel_accuracy = np.mean(pixel_accuracies)  # <<< NEW AGGREGATION
 
     # ---- Build PR curves per class at fixed IoU thresholds ----
@@ -505,8 +525,8 @@ def evaluation_loop(model, image_processor, accelerator: Accelerator, dataloader
 
     # Consolidate outputs
     combined = {k: (float(v) if torch.is_tensor(v) and v.numel() == 1 else v) for k, v in map_results.items()}
-    combined["miou"] = float(miou)
-    combined["per_class_iou"] = per_class_iou.detach().cpu().tolist()
+    # combined["miou"] = float(miou)
+    # combined["per_class_iou"] = per_class_iou.detach().cpu().tolist()
     combined["pr_curves_iou50"] = pr_curves_iou50
     combined["pr_curves_iou75"] = pr_curves_iou75
     combined["pixel_accuracy"] = float(mean_pixel_accuracy)  # <<< NEW METRIC
@@ -528,8 +548,8 @@ def main():
     do_reduce_labels = True
     hub_token = None
     num_labels = 12  # set to number of "thing" classes + background in your setup
-    per_device_eval_batch_size = 16
-    dataloader_num_workers = 16
+    per_device_eval_batch_size = 12
+    dataloader_num_workers = 12
 
     # -------------------------------
     # Accelerator
@@ -597,6 +617,14 @@ def main():
     # -------------------------------
     logger.info("***** Running evaluation on validation dataset *****")
     metrics = evaluation_loop(model, image_processor, accelerator, valid_dataloader, id2label=id2label, num_classes=12)
+
+    metrics_serializable = make_serializable(metrics)
+    with open("metrics_results.json", "w") as f:
+        json.dump(metrics_serializable, f, indent=4)
+
+    # with open("metrics_results.json", "r") as f:
+    #     metrics = json.load(f)
+
 
     plot_pr_curves(metrics['pr_curves_iou50'], id2label, out_dir="pr_curves", iou_label="IoU=0.50")
     plot_pr_curves(metrics['pr_curves_iou75'], id2label, out_dir="pr_curves", iou_label="IoU=0.75")

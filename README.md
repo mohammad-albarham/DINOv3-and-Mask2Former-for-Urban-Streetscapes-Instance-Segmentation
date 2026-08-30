@@ -40,7 +40,8 @@ settings, and model checkpoints must be adapted to the local environment.
 | `Mapillary_loading_Instance_Segmentation.py` | Standalone Mapillary instance-mask loader and visualization utilities. |
 | `evaluation.py` | Validation/evaluation utilities: instance mAP, mIoU, pixel accuracy, and PR curves at IoU 0.50/0.75. |
 | `simple_inference.py` | Command-line visualization for single images or directories. |
-| `gradio_dinov3_segmentation.py` | Interactive Gradio demo for a trained Small+ checkpoint. |
+| `gradio_dinov3_segmentation.py` | Experimental enhanced-demo generator retained from the latest branch. |
+| `enhanced_gradio_segmentation.py` | Interactive Gradio demo for a trained Small+ checkpoint. |
 | `Segmentation_pipeline.py` | Earlier DINOv3 patch-feature semantic-segmentation prototype. |
 | `Instance_segmentation_pipeline_v0.py` | Early DINOv3/Mask2Former exploration notebook-style script. |
 | `dataset_exploration.py` | Initial dataset inspection experiments. |
@@ -182,17 +183,23 @@ predicted masks and class names on the input image.
 
 ## Gradio demo
 
-Launch the interactive demo with the trained checkpoint path explicitly set:
+Launch the enhanced interactive demo with the trained checkpoint path
+explicitly set:
 
 ```bash
-uv run python gradio_dinov3_segmentation.py \
+uv run python enhanced_gradio_segmentation.py \
   --model_path ./output/dinov3-smallplus-mapillary/best_model \
-  --gradio
+  --gradio \
+  --port 7860
 ```
 
 Use `--share` only when a public Gradio link is wanted. The interface supports
 an uploaded image, a confidence threshold, and automatic visualization of the
 detected instances.
+
+The latest branch also keeps `gradio_dinov3_segmentation.py` as a generator
+for the enhanced script; run it without arguments only if that generated file
+needs to be recreated.
 
 ## Evaluation
 
@@ -207,13 +214,14 @@ uv run python evaluation.py
 The evaluation code reports:
 
 - segmentation mAP, including mAP@0.50 and mAP@0.75;
-- mean IoU and per-class IoU;
+- mean IoU and per-class IoU in the baseline evaluator;
 - mean foreground pixel accuracy; and
 - per-class precision/recall curves at IoU 0.50 and 0.75.
 
-PR plots are written to `pr_curves/`. Evaluation and training outputs are
-ignored by Git so that checkpoints and generated figures do not accidentally
-enter the source repository.
+The latest evaluation experiment also writes JSON-compatible results to
+`metrics_results.json`. PR plots are written to `pr_curves/`. Evaluation and
+training outputs are ignored by Git so that checkpoints and generated figures
+do not accidentally enter the source repository.
 
 ## Reproducibility notes
 

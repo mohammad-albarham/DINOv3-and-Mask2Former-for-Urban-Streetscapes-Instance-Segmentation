@@ -57,11 +57,11 @@ class MapillaryInstanceDataset(Dataset):
                 self.label_id_to_class_id[class_id] = len([l for l in self.labels[:class_id+1] if l["instances"]])
 
         # Get all image IDs
-        images_dir = os.path.join(root_dir, "validation", 'images')
+        images_dir = os.path.join(root_dir, split, 'images')
         self.image_files = sorted(glob.glob(os.path.join(images_dir, '*.jpg')))
         self.image_ids = [os.path.splitext(os.path.basename(f))[0] for f in self.image_files]
 
-        self.image_ids = ['2DPJuTp0mSTXXGEsWRL25g']
+        # self.image_ids = ['2d3hvB1rNaivBLVcSYHREA']
 
         print(f"Loaded {len(self.image_ids)} images from {split} split")
         print(f"Number of thing classes (with instances): {len(self.thing_classes)}")
@@ -160,7 +160,6 @@ class MapillaryInstanceDataset(Dataset):
     def get_num_classes(self):
         """Returns number of classes including background"""
         return len(self.thing_classes) + 1  # +1 for background
-
 
 #%%
 """
@@ -381,7 +380,7 @@ def visualize_instance_segmentation(image, target, class_names=None):
     img_np = np.clip(img_np, 0, 1)
 
     plt.figure(figsize=(10, 8))
-    plt.imshow(img_np)
+    plt.imshow(img_np, origin='upper')
     ax = plt.gca()
     
     # Overlay each instance mask
@@ -420,5 +419,118 @@ images, targets = next(iter(train_loader))
 
 # Visualize first image in batch
 visualize_instance_segmentation(images[0], targets[0], class_names)
+
+# %%
+
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import random
+
+def _to_numpy_image(img_t):
+    # img_t: (C,H,W) tensor in [0,1] or [0,255]
+    if isinstance(img_t, torch.Tensor):
+        img = img_t.detach().cpu().permute(1, 2, 0).float().numpy()
+    else:
+        img = img_t
+    if img.max() > 1.0:
+        img = img / 255.0
+    return np.clip(img, 0.0, 1.0)
+
+def _to_bool_masks(masks_t):
+    # masks_t: (N,H,W) or (N,1,H,W) tensor/ndarray
+    if isinstance(masks_t, torch.Tensor):
+        m = masks_t.detach().cpu()
+        if m.ndim == 4 and m.shape[1] == 1:
+            m = m[:, 0]
+        m = (m > 0.5).numpy()
+    else:
+        m = masks_t
+        if m.ndim == 4 and m.shape[1] == 1:
+            m = m[:, 0]
+        m = (m > 0.5)
+    return m.astype(bool)  # (N,H,W)
+
+def _blend_overlay(base_img, mask, color, alpha=0.5):
+    # base_img: (H,W,3) in [0,1], mask: (H,W) bool, color: (3,)
+    out = base_img.copy()
+    if mask.any():
+        out[mask] = (1 - alpha) * out[mask] + alpha * np.array(color)[None, None, :]
+    return out
+
+def visualize_triptych(image, target, class_names=None, alpha=0.5,
+                       union_color=(1.0, 0.0, 0.0), seed=0, show_count_heatmap=False):
+    """
+    - image: tensor (C,H,W)
+    - target: dict with keys 'masks' (N,H,W or N,1,H,W), 'boxes' (N,4), 'labels' (N,)
+    - class_names: optional list of names indexed by label id
+    - show_count_heatmap: if True, middle shows instance count map; else shows binary union
+    """
+    rng = np.random.RandomState(seed)
+    img = _to_numpy_image(image)
+    H, W, _ = img.shape
+
+    # Prepare masks
+    masks = _to_bool_masks(target["masks"])  # (N,H,W) bool
+    N = masks.shape[0] if masks.ndim == 3 else 0
+
+    # Total/union mask and count map
+    union_mask = masks.any(axis=0) if N > 0 else np.zeros((H, W), dtype=bool)
+    count_map = masks.sum(axis=0).astype(np.int32) if N > 0 else np.zeros((H, W), dtype=np.int32)
+
+    # Build per-instance overlay
+    overlay = img.copy()
+    for i in range(N):
+        color = rng.rand(3)  # reproducible colors
+        overlay = _blend_overlay(overlay, masks[i], color, alpha=alpha)
+
+    # Figure with three panels
+    fig, ax = plt.subplots(1, 3, figsize=(15, 5))
+
+    # Left: original
+    ax[0].imshow(img)
+    ax[0].set_title("Original")
+    ax[0].axis("off")
+
+    # Middle: total mask or count heatmap
+    if show_count_heatmap:
+        hm = ax[1].imshow(count_map, cmap="magma")
+        ax[1].set_title("Instance Count")
+        fig.colorbar(hm, ax=ax[1], fraction=0.046, pad=0.04)
+    else:
+        ax[1].imshow(union_mask.astype(np.float32), cmap="gray")
+        ax[1].set_title("Total Mask (Union)")
+    ax[1].axis("off")
+
+    # Right: overlay + optional boxes/labels
+    ax[2].imshow(overlay)
+    if "boxes" in target and "labels" in target and N > 0:
+        boxes = target["boxes"].detach().cpu().numpy() if isinstance(target["boxes"], torch.Tensor) else target["boxes"]
+        labels = target["labels"].detach().cpu().numpy() if isinstance(target["labels"], torch.Tensor) else target["labels"]
+        for i in range(N):
+            # Color consistent with overlay sampling
+            rng_i = np.random.RandomState(seed + i)
+            color = rng_i.rand(3)
+            x1, y1, x2, y2 = boxes[i].astype(int)
+            rect = plt.Rectangle((x1, y1), x2 - x1, y2 - y1, fill=False,
+                                 color=color, linewidth=1.0)
+            ax[2].add_patch(rect)
+            cls = int(labels[i])
+            name = class_names[cls] if class_names is not None and cls < len(class_names) else str(cls)
+            ax[2].text(x1, max(0, y1 - 2), name, color="white", fontsize=8,
+                       bbox=dict(facecolor=tuple(color), alpha=0.7, pad=1.5))
+    ax[2].set_title("Overlay")
+    ax[2].axis("off")
+
+    plt.tight_layout()
+    plt.show()
+    return fig, ax
+
+#%%
+
+images, targets = next(iter(train_loader))
+_ = visualize_triptych(images[0], targets[0], class_names=class_names,
+                       alpha=0.5, union_color=(1,0,0), seed=0, show_count_heatmap=False)
 
 # %%

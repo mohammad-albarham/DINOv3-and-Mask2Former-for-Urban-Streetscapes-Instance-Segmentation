@@ -14,8 +14,6 @@ outputs = model(pixel_values=dummy_image, output_hidden_states=True, return_dict
 
 
 #%%
-
-
 outputs.last_hidden_state.shape
 #%%
 hidden_states = outputs.hidden_states
