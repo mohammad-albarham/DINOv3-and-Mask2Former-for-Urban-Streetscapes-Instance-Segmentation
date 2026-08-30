@@ -179,9 +179,7 @@ CLASS_NAMES = None
 def main():
     global model, image_processor, CLASS_NAMES
     parser = argparse.ArgumentParser(description="DINOv3 Mask2Former Inference with Gradio")
-    parser.add_argument("--model_path", "-m",
-                        default="/Users/pain/Desktop/Chalmers_University_of_Technlogy/Courses/third_semster/SP5/SSY340/Project/Test_Dinov3/output_final_fixed_evaluation_12_classes_enhance_model/dinov3-smallplus-mask2former-v1.0-3000_samples-12-classes-enhanced/best_model",
-                        help="Path to model")
+    parser.add_argument("--model_path", "-m", required=True, help="Path to model")
     parser.add_argument("--gradio", "-g", action="store_true", help="Launch Gradio interface")
     parser.add_argument("--share", "-s", action="store_true", help="Create public Gradio link")
     args = parser.parse_args()
